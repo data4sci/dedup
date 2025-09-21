@@ -651,7 +651,26 @@ def curate_video(
     eps_used = auto_eps_from_adjacent_sims(prelim, 0.90) if prelim else 0.1
     logger.debug(f"Using DBSCAN eps={eps_used:.3f} for deduplication")
     final = deduplicate_quality_first(prelim, keep_frac_per_cluster=0.10)
-    final = sorted(final, key=lambda x: x.ml_score, reverse=True)[:target_size]
+    # sort by score
+    final = sorted(final, key=lambda x: x.ml_score, reverse=True)
+
+    # If deduplication removed too many frames, refill from remaining candidates
+    if len(final) < target_size:
+        logger.debug(
+            f"Deduplication reduced count ({len(final)}) below target ({target_size}), attempting refill"
+        )
+        # consider candidates that were not in prelim or were removed by dedup
+        remaining_pool = [f for f in cand_sorted if f not in final]
+        # preserve order by ml_score
+        remaining_pool = sorted(remaining_pool, key=lambda x: x.ml_score, reverse=True)
+        need = target_size - len(final)
+        to_add = remaining_pool[:need]
+        if to_add:
+            final.extend(to_add)
+            logger.debug(f"Refilled {len(to_add)} frames to reach target_size")
+
+    # ensure final length does not exceed target
+    final = final[:target_size]
     logger.debug(f"Deduplication: {len(prelim)} → {len(final)} frames")
 
     # 7) Uložení
