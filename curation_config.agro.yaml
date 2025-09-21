@@ -1,0 +1,19 @@
+# Agro stratification config (example)
+stratification:
+  axes:
+    altitude: [low, mid, high] # letová výška
+    view: [nadir, oblique_low, oblique_high] # typ pohledu: shora, šikmý nízký, šikmý vysoký
+    cover: [bare_soil, crop_sparse, crop_dense] # typ pokryvu: holá půda, řídká vegetace, hustá vegetace
+    lighting: [dark, normal, bright] # osvětlení scény: tmavé, normální, světlé
+
+  # Cílové podíly (součet -> 1.0). '*' se rozdělí rovnoměrně mezi nezmíněné kombinace.
+  targets:
+    "altitude:low|view:nadir|cover:crop_dense|lighting:normal": 0.24
+    "altitude:mid|view:nadir|cover:crop_dense|lighting:normal": 0.16
+    # ostatní kombinace dostanou rovnoměrně zbylých 0.60
+    "*": 0.60
+
+  # Limity / ochrany proti dominanci špatně užitečných strat
+  limits:
+    bare_soil_max_ratio: 0.20 # max 20 % snímků z holé půdy
+    windy_max_ratio: 0.15 # (placeholder; pokud doplníš motion proxy)

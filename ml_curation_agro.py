@@ -1,0 +1,611 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ML-Driven Frame Curation — Agro Stratification (MVP)
+====================================================
+Funkční kurace snímků z agro-droních videí se *stratifikací* podle:
+  - altitude proxy (HF energy),
+  - view angle proxy (entropie orientací),
+  - vegetation cover (ExG/VARI proxy),
+  - lighting (průměrná intenzita).
+
+Pipeline:
+  1) Pre-filter (ostrost/kontrast) + rychlé embeddingy (HSV+LowRes).
+  2) ML skóre (quality + content_novelty + geom_proxy).
+  3) Stratifikace dle 4 os (altitude, view, cover, lighting) s cílovými podíly z YAML.
+  4) Doplnění top kvality.
+  5) Quality-aware deduplikace (DBSCAN s cosine; eps odhad z distribuce).
+  6) Uložení snímků + manifest.
+
+Závislosti:
+    pip install opencv-python numpy scikit-learn pyyaml
+
+Použití:
+    python ml_curation_agro.py input.mp4 -o out_dir --config curation_config.agro.yaml
+"""
+from __future__ import annotations
+
+import os
+import json
+import math
+import argparse
+from dataclasses import dataclass, asdict
+from typing import List, Tuple, Dict, Optional, Iterable
+from collections import defaultdict
+
+import numpy as np
+import cv2
+import yaml
+
+try:
+    from sklearn.cluster import DBSCAN
+    HAVE_SKLEARN = True
+except Exception:
+    HAVE_SKLEARN = False
+
+
+# -----------------------------------------------------------------------------
+# Datové struktury
+# -----------------------------------------------------------------------------
+@dataclass
+class FrameInfo:
+    idx: int
+    t_sec: float
+    bgr: np.ndarray
+    gray: np.ndarray
+    sharpness: float
+    contrast: float
+    exposure_score: float
+    noise_score: float
+    hsv_hist: np.ndarray           # (H,S,V) histogram (L2 norm)
+    lowres_vec: np.ndarray         # LowRes grayscale vector (L2 norm)
+    embed: np.ndarray              # concat(hsv_hist, lowres_vec) -> L2 norm
+    ml_score: float = 0.0
+    subscores: Optional[Dict[str, float]] = None
+
+    # Agro proxies
+    hf_energy: float = 0.0                 # altitude proxy
+    view_entropy_val: float = 0.0          # view proxy
+    green_cover: float = 0.0               # cover proxy (0..1)
+    lighting_mean: float = 0.0             # průměrná intenzita
+
+    # Binned strata (altitude, view, cover, lighting)
+    strata: Optional[Tuple[str, str, str, str]] = None
+
+
+# -----------------------------------------------------------------------------
+# Nízké level metriky kvality
+# -----------------------------------------------------------------------------
+def variance_of_laplacian(gray: np.ndarray) -> float:
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def estimate_contrast(gray: np.ndarray) -> float:
+    return float(np.std(gray))
+
+
+def exposure_metrics(gray: np.ndarray) -> Tuple[float, float, float]:
+    mean = float(np.mean(gray))
+    hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).ravel()
+    hist = hist / (hist.sum() + 1e-9)
+    under = float(hist[:10].sum())
+    over  = float(hist[246:].sum())
+    return mean, under, over
+
+
+def exposure_score_from_metrics(mean: float, under_frac: float, over_frac: float) -> float:
+    center_penalty = abs(mean - 128.0) / 128.0
+    clip_penalty = 2.0 * (under_frac + over_frac)
+    raw = 1.0 - min(1.0, 0.6 * center_penalty + 0.4 * clip_penalty)
+    return float(max(0.0, min(1.0, raw)))
+
+
+def estimate_noise_score(gray: np.ndarray) -> float:
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    resid = gray.astype(np.float32) - blur.astype(np.float32)
+    resid_std = float(np.std(resid))
+    score = 1.0 - min(1.0, resid_std / 25.0)
+    return float(max(0.0, score))
+
+
+# -----------------------------------------------------------------------------
+# Rychlé embeddingy
+# -----------------------------------------------------------------------------
+def hsv_histogram(bgr: np.ndarray, bins: Tuple[int, int, int] = (16, 16, 16)) -> np.ndarray:
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    h_bins, s_bins, v_bins = bins
+    h = cv2.calcHist([hsv], [0], None, [h_bins], [0, 180])
+    s = cv2.calcHist([hsv], [1], None, [s_bins], [0, 256])
+    v = cv2.calcHist([hsv], [2], None, [v_bins], [0, 256])
+    hist = np.concatenate([h.ravel(), s.ravel(), v.ravel()]).astype(np.float32)
+    hist /= (np.linalg.norm(hist) + 1e-9)
+    return hist
+
+
+def lowres_embedding(bgr: np.ndarray, size: Tuple[int, int] = (64, 36)) -> np.ndarray:
+    small = cv2.resize(bgr, (size[0], size[1]), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    gray -= gray.mean()
+    vec = gray.reshape(-1)
+    vec /= (np.linalg.norm(vec) + 1e-9)
+    return vec.astype(np.float32)
+
+
+def combined_embed(bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    hsv = hsv_histogram(bgr)
+    low = lowres_embedding(bgr)
+    emb = np.concatenate([hsv, low]).astype(np.float32)
+    emb /= (np.linalg.norm(emb) + 1e-9)
+    return hsv, low, emb
+
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    a = a / (np.linalg.norm(a) + 1e-9)
+    b = b / (np.linalg.norm(b) + 1e-9)
+    return float(np.dot(a, b))
+
+
+# -----------------------------------------------------------------------------
+# Agro proxies a binning
+# -----------------------------------------------------------------------------
+def altitude_proxy(gray: np.ndarray) -> float:
+    # HF energie jako průměr absolutní hodnoty high-pass
+    hp = gray.astype(np.float32) - cv2.GaussianBlur(gray, (3,3), 0)
+    return float(np.mean(np.abs(hp)))
+
+
+def view_entropy(gray: np.ndarray, bins: int = 8) -> float:
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    mag, ang = cv2.cartToPolar(gx, gy, angleInDegrees=False)
+    hist, _ = np.histogram(ang.ravel(), bins=bins, range=(0, 2*np.pi), weights=mag.ravel())
+    p = hist / (hist.sum() + 1e-9)
+    ent = -np.sum(p * np.log(p + 1e-9))
+    return float(ent)
+
+
+def green_cover_ratio(bgr: np.ndarray) -> float:
+    # Excess Green proxy (0..1)
+    b,g,r = cv2.split(bgr.astype(np.float32) + 1e-6)
+    exg = 2*g - r - b
+    exg_norm = (exg - exg.min()) / (exg.max() - exg.min() + 1e-9)
+    thr = 0.6  # lze parametrizovat v YAML
+    return float(np.mean(exg_norm >= thr))
+
+
+def classify_lighting(gray: np.ndarray) -> float:
+    return float(np.mean(gray))
+
+
+def bin_altitude(hf: float, q33: float, q66: float) -> str:
+    if hf >= q66: return "low"   # hodně detailů -> nízko
+    if hf >= q33: return "mid"
+    return "high"                # málo detailů -> vysoko
+
+
+def bin_view(ent: float, t1: float = 1.6, t2: float = 1.9) -> str:
+    if ent >= t2: return "nadir"
+    if ent >= t1: return "oblique_low"
+    return "oblique_high"
+
+
+def bin_cover(ratio: float) -> str:
+    if ratio >= 0.6: return "crop_dense"
+    if ratio >= 0.25: return "crop_sparse"
+    return "bare_soil"
+
+
+def bin_lighting(mean_int: float) -> str:
+    if mean_int < 70: return "dark"
+    if mean_int > 160: return "bright"
+    return "normal"
+
+
+# -----------------------------------------------------------------------------
+# Streamování videa + prefilter + výpočet proxy
+# -----------------------------------------------------------------------------
+def iter_video_frames(video_path: str, stride: int = 1) -> Iterable[Tuple[int, float, np.ndarray]]:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Nelze otevřít video: {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    idx = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if idx % stride == 0:
+            yield idx, (idx / fps), frame
+        idx += 1
+    cap.release()
+
+
+def prefilter_candidates(video_path: str, stride: int = 1,
+                         min_sharpness: float = 80.0,
+                         min_contrast: float = 20.0) -> List[FrameInfo]:
+    out: List[FrameInfo] = []
+    for idx, t_sec, bgr in iter_video_frames(video_path, stride=stride):
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        sharp = variance_of_laplacian(gray)
+        contr = estimate_contrast(gray)
+        if sharp < min_sharpness or contr < min_contrast:
+            continue
+        mean, under, over = exposure_metrics(gray)
+        expo = exposure_score_from_metrics(mean, under, over)
+        noise = estimate_noise_score(gray)
+        hsv, low, emb = combined_embed(bgr)
+
+        # agro proxies (continuous)
+        hf = altitude_proxy(gray)
+        ent = view_entropy(gray)
+        gcr = green_cover_ratio(bgr)
+        light_mean = float(np.mean(gray))
+
+        out.append(FrameInfo(
+            idx=idx, t_sec=t_sec, bgr=bgr, gray=gray,
+            sharpness=sharp, contrast=contr,
+            exposure_score=expo, noise_score=noise,
+            hsv_hist=hsv, lowres_vec=low, embed=emb,
+            hf_energy=hf, view_entropy_val=ent, green_cover=gcr, lighting_mean=light_mean
+        ))
+    return out
+
+
+# -----------------------------------------------------------------------------
+# ML skórování (bez DL)
+# -----------------------------------------------------------------------------
+class MLFrameScorer:
+    def __init__(self, novelty_memory: int = 64):
+        self.prototypes: List[np.ndarray] = []
+        self.novelty_memory = int(novelty_memory)
+
+    @staticmethod
+    def _scale(x: float, lo: float, hi: float) -> float:
+        return float(max(0.0, min(1.0, (x - lo) / (hi - lo + 1e-9))))
+
+    def _quality_score(self, f: FrameInfo) -> float:
+        s = self._scale(f.sharpness, 80.0, 300.0)
+        c = self._scale(f.contrast, 20.0, 80.0)
+        e = f.exposure_score
+        n = f.noise_score
+        return 0.35*s + 0.30*c + 0.25*e + 0.10*n
+
+    def _geom_score(self, f: FrameInfo) -> float:
+        gx = cv2.Sobel(f.gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(f.gray, cv2.CV_32F, 0, 1, ksize=3)
+        mag, ang = cv2.cartToPolar(gx, gy, angleInDegrees=False)
+        bins = 8
+        hist, _ = np.histogram(ang.ravel(), bins=bins, range=(0, 2*np.pi), weights=mag.ravel())
+        hist = hist.astype(np.float32) / (hist.sum() + 1e-9)
+        geom = 1.0 - float(hist.max())
+        return float(max(0.0, min(1.0, geom)))
+
+    def _novelty_score(self, emb: np.ndarray) -> float:
+        if not self.prototypes:
+            return 1.0
+        sims = [cosine_similarity(emb, p) for p in self.prototypes[-self.novelty_memory:]]
+        max_sim = max(sims) if sims else 0.0
+        return float(max(0.0, min(1.0, 1.0 - max_sim)))
+
+    def score(self, frames: List[FrameInfo]) -> None:
+        for f in frames:
+            q = self._quality_score(f)
+            nov = self._novelty_score(f.embed)
+            geom = self._geom_score(f)
+            total = 0.4*q + 0.45*nov + 0.15*geom
+            f.ml_score = float(total)
+            f.subscores = {"quality": q, "content_novelty": nov, "geom": geom}
+            if nov > 0.3:
+                self.prototypes.append(f.embed)
+
+
+# -----------------------------------------------------------------------------
+# Stratifikace (4 osy) + YAML cíle a limity
+# -----------------------------------------------------------------------------
+class AgroStratifier:
+    """
+    Převádí kontinuální proxy -> binned straty a udržuje výběr podle YAML targetů.
+    YAML formát (viz curation_config.agro.yaml):
+      stratification:
+        axes:
+          altitude: [low, mid, high]
+          view: [nadir, oblique_low, oblique_high]
+          cover: [bare_soil, crop_sparse, crop_dense]
+          lighting: [dark, normal, bright]
+        targets:
+          "altitude:low|view:nadir|cover:crop_dense|lighting:normal": 0.24
+          "*": 0.76
+        limits:
+          windy_max_ratio: 0.15
+          bare_soil_max_ratio: 0.20
+    """
+    def __init__(self, config: Dict):
+        sconf = (config or {}).get("stratification", {})
+        self.axes = sconf.get("axes", {
+            "altitude": ["low", "mid", "high"],
+            "view": ["nadir", "oblique_low", "oblique_high"],
+            "cover": ["bare_soil", "crop_sparse", "crop_dense"],
+            "lighting": ["dark", "normal", "bright"],
+        })
+        self.targets_raw: Dict[str, float] = sconf.get("targets", {"*": 1.0})
+        self.limits = sconf.get("limits", {"windy_max_ratio": 0.15, "bare_soil_max_ratio": 0.20})
+        self.counts: Dict[str, int] = defaultdict(int)
+        self.total_selected: int = 0
+
+        # Expand '*' later proportionally over missing combinations
+        self.combinations = self._all_combinations()
+
+        # Compile explicit targets and distribute wildcard
+        self.targets = self._compile_targets()
+
+    def _all_combinations(self) -> List[str]:
+        from itertools import product
+        keys = list(self.axes.keys())
+        values = [self.axes[k] for k in keys]
+        combos = []
+        for vals in product(*values):
+            parts = [f"{k}:{v}" for k, v in zip(keys, vals)]
+            combos.append("|".join(parts))
+        return combos
+
+    def _compile_targets(self) -> Dict[str, float]:
+        explicit_total = sum(v for k, v in self.targets_raw.items() if k != "*")
+        wildcard = self.targets_raw.get("*", 0.0)
+        remaining = max(0.0, 1.0 - explicit_total)
+        if wildcard > 0:
+            # normalize wildcard to remaining
+            wildcard_share = remaining
+        else:
+            wildcard_share = 0.0
+
+        # find combos without explicit target
+        explicit_keys = {k for k in self.targets_raw.keys() if k != "*"}
+        missing = [c for c in self.combinations if c not in explicit_keys]
+        per = (wildcard_share / len(missing)) if missing and wildcard_share > 0 else 0.0
+
+        targets = {}
+        for c in self.combinations:
+            if c in self.targets_raw and c != "*":
+                targets[c] = float(self.targets_raw[c])
+            else:
+                targets[c] = float(per)
+        # normalize to sum=1 (small numeric drift)
+        s = sum(targets.values()) + 1e-9
+        for k in list(targets.keys()):
+            targets[k] = targets[k] / s
+        return targets
+
+    @staticmethod
+    def combo_key(altitude: str, view: str, cover: str, lighting: str) -> str:
+        return f"altitude:{altitude}|view:{view}|cover:{cover}|lighting:{lighting}"
+
+    def select(self, frames_sorted: List[FrameInfo], target_size: int) -> List[FrameInfo]:
+        selected: List[FrameInfo] = []
+        for f in frames_sorted:
+            if len(selected) >= target_size:
+                break
+
+            # derive key and ratios
+            a, v, c, l = f.strata  # type: ignore
+            key = self.combo_key(a, v, c, l)
+
+            # enforce limits (example: bare_soil cap)
+            if c == "bare_soil":
+                if self._current_ratio(selected, cover="bare_soil") >= self.limits.get("bare_soil_max_ratio", 1.0):
+                    continue
+
+            # acceptance rule: under-target or very high quality
+            curr_ratio = self._current_ratio(selected, key=key)
+            target_ratio = self.targets.get(key, 0.0)
+            if curr_ratio < target_ratio or f.ml_score > 0.95:
+                selected.append(f)
+                self.counts[key] += 1
+                self.total_selected += 1
+
+        return selected
+
+    def _current_ratio(self, selected: List[FrameInfo], key: Optional[str] = None,
+                       cover: Optional[str] = None) -> float:
+        if not selected:
+            return 0.0
+        if cover is not None:
+            c = sum(1 for f in selected if f.strata and f.strata[2] == cover)
+            return c / len(selected)
+        if key is not None:
+            c = sum(1 for f in selected if f.strata and self.combo_key(*f.strata) == key)
+            return c / len(selected)
+        return 0.0
+
+
+# -----------------------------------------------------------------------------
+# Quality-aware deduplikace (DBSCAN) + eps odhad
+# -----------------------------------------------------------------------------
+def auto_eps_from_adjacent_sims(frames: List[FrameInfo], quantile: float = 0.90) -> float:
+    if len(frames) < 3:
+        return 0.10
+    sims = []
+    for i in range(len(frames)-1):
+        sims.append(cosine_similarity(frames[i].embed, frames[i+1].embed))
+    Q = float(np.quantile(np.array(sims, dtype=np.float32), quantile))
+    eps = max(0.02, min(0.30, 1.0 - Q))
+    return eps
+
+
+def deduplicate_quality_first(frames: List[FrameInfo], keep_frac_per_cluster: float = 0.10) -> List[FrameInfo]:
+    if not frames:
+        return []
+    if not HAVE_SKLEARN:
+        print("[WARN] scikit-learn není k dispozici; greedy fallback dedup.")
+        selected: List[FrameInfo] = []
+        pivot: Optional[FrameInfo] = None
+        thr = 1.0 - auto_eps_from_adjacent_sims(frames, 0.90)
+        for f in frames:
+            if pivot is None:
+                selected.append(f); pivot = f; continue
+            if cosine_similarity(f.embed, pivot.embed) < thr:
+                selected.append(f); pivot = f
+        return selected
+
+    X = np.stack([f.embed for f in frames], axis=0)
+    eps = auto_eps_from_adjacent_sims(frames, 0.90)
+    clustering = DBSCAN(eps=eps, min_samples=2, metric='cosine').fit(X)
+    labels = clustering.labels_
+
+    clusters: Dict[int, List[FrameInfo]] = defaultdict(list)
+    for f, lab in zip(frames, labels):
+        clusters[lab].append(f)
+
+    selected: List[FrameInfo] = []
+    for lab, items in clusters.items():
+        if lab == -1:
+            selected.extend(items)  # singletons
+            continue
+        items_sorted = sorted(items, key=lambda x: x.ml_score, reverse=True)
+        k = max(1, int(round(len(items_sorted) * keep_frac_per_cluster)))
+        selected.extend(items_sorted[:k])
+    return selected
+
+
+# -----------------------------------------------------------------------------
+# End-to-end kurace
+# -----------------------------------------------------------------------------
+def curate_video(
+    video_path: str,
+    out_dir: str,
+    stride: int = 1,
+    target_size: int = 500,
+    min_sharpness: float = 80.0,
+    min_contrast: float = 20.0,
+    manifest_name: str = "manifest.json",
+    config: Optional[Dict] = None
+) -> List[FrameInfo]:
+    os.makedirs(out_dir, exist_ok=True)
+
+    # 1) Pre-filter
+    candidates = prefilter_candidates(
+        video_path=video_path,
+        stride=stride,
+        min_sharpness=min_sharpness,
+        min_contrast=min_contrast
+    )
+    if not candidates:
+        print("[INFO] Žádní kandidáti nesplnili pre-filter.")
+        return []
+
+    # 2) ML skórování
+    scorer = MLFrameScorer(novelty_memory=64)
+    scorer.score(candidates)
+
+    # 3) Binning agro os (potřebujeme kvantily pro altitude)
+    hf_vals = np.array([f.hf_energy for f in candidates], dtype=np.float32)
+    q33, q66 = np.quantile(hf_vals, [0.33, 0.66]).tolist()
+
+    for f in candidates:
+        a = bin_altitude(f.hf_energy, q33, q66)
+        v = bin_view(f.view_entropy_val, t1=1.6, t2=1.9)
+        c = bin_cover(f.green_cover)
+        l = bin_lighting(f.lighting_mean)
+        f.strata = (a, v, c, l)
+
+    # 4) Stratifikace z YAML
+    strat = AgroStratifier(config or {})
+    cand_sorted = sorted(candidates, key=lambda x: x.ml_score, reverse=True)
+    first_batch = strat.select(cand_sorted, target_size=max(1, target_size // 2))
+
+    # 5) Doplnění top kvality
+    remaining = [f for f in cand_sorted if f not in first_batch]
+    top_quality = remaining[:max(1, target_size - len(first_batch))]
+    prelim = first_batch + top_quality
+
+    # 6) Dedup
+    final = deduplicate_quality_first(prelim, keep_frac_per_cluster=0.10)
+    final = sorted(final, key=lambda x: x.ml_score, reverse=True)[:target_size]
+
+    # 7) Uložení
+    paths: List[str] = []
+    for i, f in enumerate(final):
+        fname = f"frame_{i:06d}_src{f.idx:06d}_t{f.t_sec:010.3f}.jpg"
+        path = os.path.join(out_dir, fname)
+        cv2.imwrite(path, f.bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        paths.append(path)
+
+    manifest = {
+        "video": os.path.abspath(video_path),
+        "count_candidates": len(candidates),
+        "count_selected": len(final),
+        "out_dir": os.path.abspath(out_dir),
+        "axes": ["altitude", "view", "cover", "lighting"],
+        "frames": [
+            {
+                "saved_path": os.path.abspath(p),
+                "source_index": f.idx,
+                "t_sec": f.t_sec,
+                "ml_score": f.ml_score,
+                "subscores": f.subscores,
+                "strata": f.strata,
+                "sharpness": f.sharpness,
+                "contrast": f.contrast,
+                "exposure_score": f.exposure_score,
+                "noise_score": f.noise_score,
+                "hf_energy": f.hf_energy,
+                "view_entropy": f.view_entropy_val,
+                "green_cover": f.green_cover,
+                "lighting_mean": f.lighting_mean
+            }
+            for p, f in zip(paths, final)
+        ]
+    }
+    with open(os.path.join(out_dir, manifest_name), "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, ensure_ascii=False, indent=2)
+
+    print(f"[INFO] Hotovo. Kandidátů: {len(candidates)} → vybráno: {len(final)}. Výstup: {out_dir}")
+    return final
+
+
+# -----------------------------------------------------------------------------
+# YAML načtení
+# -----------------------------------------------------------------------------
+def load_yaml(path: Optional[str]) -> Dict:
+    if path and os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="ML-Driven Frame Curation — Agro Stratification (MVP).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    p.add_argument("video", help="Vstupní video soubor")
+    p.add_argument("-o", "--out", default="curated_out", help="Výstupní složka")
+    p.add_argument("--config", default=None, help="Cesta k YAML konfiguraci (volitelné)")
+    p.add_argument("--stride", type=int, default=2, help="Vybírat každý N-tý snímek")
+    p.add_argument("--target-size", type=int, default=500, help="Cílový počet vybraných snímků")
+    p.add_argument("--min-sharpness", type=float, default=80.0, help="Minimální ostrost (Variance of Laplacian)")
+    p.add_argument("--min-contrast", type=float, default=20.0, help="Minimální kontrast (std gray)")
+    p.add_argument("--manifest", default="manifest.json", help="Název manifest JSON")
+    return p
+
+
+def main():
+    ap = build_argparser()
+    args = ap.parse_args()
+    conf = load_yaml(args.config)
+    curate_video(
+        video_path=args.video,
+        out_dir=args.out,
+        stride=int(args.stride),
+        target_size=int(args.target_size),
+        min_sharpness=float(args.min_sharpness),
+        min_contrast=float(args.min_contrast),
+        manifest_name=str(args.manifest),
+        config=conf
+    )
+
+
+if __name__ == "__main__":
+    main()

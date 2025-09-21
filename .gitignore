@@ -215,6 +215,13 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# specify
+.specify/
+
+# github
+.github/
+
 # data
 data/
 out_frames/
+curated_out/
