@@ -11,11 +11,10 @@ Funkční kurace snímků z agro-droních videí se *stratifikací* podle:
 
 Pipeline:
   1) Pre-filter (ostrost/kontrast) + rychlé embeddingy (HSV+LowRes).
-  2) ML skóre (quality + content_novelty + geom_proxy).
-  3) Stratifikace dle 4 os (altitude, view, cover, lighting) s cílovými podíly z YAML.
-  4) Doplnění top kvality.
-  5) Quality-aware deduplikace (DBSCAN s cosine; eps odhad z distribuce).
-  6) Uložení snímků + manifest.
+  2) ML skóre (quality + content_novelty).
+  3) Výběr podle target_size (stratifikace) nebo threshold (top % kandidátů).
+  4) Quality-aware deduplikace (greedy s cosine threshold).
+  5) Uložení snímků + manifest.
 
 Závislosti:
     pip install opencv-python numpy scikit-learn pyyaml
@@ -41,12 +40,7 @@ import time
 
 logger = logging.getLogger(__name__)
 
-try:
-    from sklearn.cluster import DBSCAN
-
-    HAVE_SKLEARN = True
-except Exception:
-    HAVE_SKLEARN = False
+from sklearn.cluster import DBSCAN
 
 
 # -----------------------------------------------------------------------------
@@ -119,8 +113,10 @@ def estimate_noise_score(gray: np.ndarray) -> float:
 # Rychlé embeddingy
 # -----------------------------------------------------------------------------
 def hsv_histogram(
-    bgr: np.ndarray, bins: Tuple[int, int, int] = (16, 16, 16)
+    bgr: np.ndarray, bins: Optional[Tuple[int, int, int]] = None
 ) -> np.ndarray:
+    if bins is None:
+        bins = (16, 16, 16)
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     h_bins, s_bins, v_bins = bins
     h = cv2.calcHist([hsv], [0], None, [h_bins], [0, 180])
@@ -131,7 +127,11 @@ def hsv_histogram(
     return hist
 
 
-def lowres_embedding(bgr: np.ndarray, size: Tuple[int, int] = (64, 36)) -> np.ndarray:
+def lowres_embedding(
+    bgr: np.ndarray, size: Optional[Tuple[int, int]] = None
+) -> np.ndarray:
+    if size is None:
+        size = (64, 36)
     small = cv2.resize(bgr, (size[0], size[1]), interpolation=cv2.INTER_AREA)
     gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32)
     gray -= gray.mean()
@@ -140,9 +140,15 @@ def lowres_embedding(bgr: np.ndarray, size: Tuple[int, int] = (64, 36)) -> np.nd
     return vec.astype(np.float32)
 
 
-def combined_embed(bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    hsv = hsv_histogram(bgr)
-    low = lowres_embedding(bgr)
+def combined_embed(
+    bgr: np.ndarray, config: Optional[Dict] = None
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    embedding_config = (config or {}).get("embedding", {})
+    hsv_bins = embedding_config.get("hsv_bins", (16, 16, 16))
+    lowres_size = embedding_config.get("lowres_size", (64, 36))
+
+    hsv = hsv_histogram(bgr, bins=hsv_bins)
+    low = lowres_embedding(bgr, size=lowres_size)
     emb = np.concatenate([hsv, low]).astype(np.float32)
     emb /= np.linalg.norm(emb) + 1e-9
     return hsv, low, emb
@@ -163,7 +169,9 @@ def altitude_proxy(gray: np.ndarray) -> float:
     return float(np.mean(np.abs(hp)))
 
 
-def view_entropy(gray: np.ndarray, bins: int = 8) -> float:
+def view_entropy(gray: np.ndarray, bins: Optional[int] = None) -> float:
+    if bins is None:
+        bins = 8
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     mag, ang = cv2.cartToPolar(gx, gy, angleInDegrees=False)
@@ -175,49 +183,46 @@ def view_entropy(gray: np.ndarray, bins: int = 8) -> float:
     return float(ent)
 
 
-def green_cover_ratio(bgr: np.ndarray) -> float:
+def green_cover_ratio(bgr: np.ndarray, threshold: Optional[float] = None) -> float:
     # Excess Green proxy (0..1)
+    if threshold is None:
+        threshold = 0.6
     b, g, r = cv2.split(bgr.astype(np.float32) + 1e-6)
     exg = 2 * g - r - b
     exg_norm = (exg - exg.min()) / (exg.max() - exg.min() + 1e-9)
-    thr = 0.6  # lze parametrizovat v YAML
-    return float(np.mean(exg_norm >= thr))
+    return float(np.mean(exg_norm >= threshold))
 
 
 def classify_lighting(gray: np.ndarray) -> float:
     return float(np.mean(gray))
 
 
-def bin_altitude(hf: float, q33: float, q66: float) -> str:
-    if hf >= q66:
+def bin_altitude(hf: float, q50: float) -> str:
+    if hf >= q50:
         return "low"  # hodně detailů -> nízko
-    if hf >= q33:
-        return "mid"
     return "high"  # málo detailů -> vysoko
 
 
-def bin_view(ent: float, t1: float = 1.6, t2: float = 1.9) -> str:
-    if ent >= t2:
+def bin_view(ent: float, t: Optional[float] = None) -> str:
+    if t is None:
+        t = 1.8
+    if ent >= t:
         return "nadir"
-    if ent >= t1:
-        return "oblique_low"
-    return "oblique_high"
+    return "oblique"
 
 
-def bin_cover(ratio: float) -> str:
-    if ratio >= 0.6:
-        return "crop_dense"
-    if ratio >= 0.25:
-        return "crop_sparse"
-    return "bare_soil"
+def bin_cover(ratio: float, threshold: float = 0.5) -> str:
+    if ratio >= threshold:
+        return "dense"
+    return "sparse"
 
 
-def bin_lighting(mean_int: float) -> str:
-    if mean_int < 70:
+def bin_lighting(mean_int: float, threshold: Optional[float] = None) -> str:
+    if threshold is None:
+        threshold = 115
+    if mean_int < threshold:
         return "dark"
-    if mean_int > 160:
-        return "bright"
-    return "normal"
+    return "bright"
 
 
 # -----------------------------------------------------------------------------
@@ -246,6 +251,7 @@ def prefilter_candidates(
     stride: int = 1,
     min_sharpness: float = 80.0,
     min_contrast: float = 20.0,
+    config: Optional[Dict] = None,
 ) -> List[FrameInfo]:
     logger.debug(
         f"Starting pre-filter with stride={stride}, min_sharpness={min_sharpness}, min_contrast={min_contrast}"
@@ -254,9 +260,13 @@ def prefilter_candidates(
     total_frames = 0
     filtered_out = 0
 
+    output_config = (config or {}).get("output", {})
+    log_intervals = output_config.get("log_intervals", {})
+    frames_processed_interval = log_intervals.get("frames_processed", 1000)
+
     for idx, t_sec, bgr in iter_video_frames(video_path, stride=stride):
         total_frames += 1
-        if total_frames % 1000 == 0:
+        if total_frames % frames_processed_interval == 0:
             logger.debug(f"Processed {total_frames} frames, kept {len(out)} candidates")
 
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -276,9 +286,13 @@ def prefilter_candidates(
         hsv, low, emb = combined_embed(bgr)
 
         # agro proxies (continuous)
+        proxies_config = (config or {}).get("proxies", {})
+        view_bins = proxies_config.get("view_entropy_bins", 8)
+        green_threshold = proxies_config.get("green_cover_threshold", 0.6)
+
         hf = altitude_proxy(gray)
-        ent = view_entropy(gray)
-        gcr = green_cover_ratio(bgr)
+        ent = view_entropy(gray, bins=view_bins)
+        gcr = green_cover_ratio(bgr, threshold=green_threshold)
         light_mean = float(np.mean(gray))
 
         logger.debug(
@@ -315,21 +329,50 @@ def prefilter_candidates(
 # ML skórování (bez DL)
 # -----------------------------------------------------------------------------
 class MLFrameScorer:
-    def __init__(self, novelty_memory: int = 64, novelty_threshold: float = 0.3):
+    def __init__(
+        self,
+        novelty_memory: int = 64,
+        novelty_threshold: float = 0.3,
+        config: Optional[Dict] = None,
+    ):
         self.prototypes: List[np.ndarray] = []
         self.novelty_memory = int(novelty_memory)
         self.novelty_threshold = novelty_threshold
+
+        # Load scoring weights from config
+        scoring_config = (config or {}).get("scoring", {})
+        weights = scoring_config.get("weights", {})
+        quality_components = scoring_config.get("quality_components", {})
+        scale_ranges = scoring_config.get("scale_ranges", {})
+
+        # Default weights if not in config
+        self.weight_quality = weights.get("quality", 0.5)
+        self.weight_novelty = weights.get("content_novelty", 0.5)
+
+        self.quality_sharpness = quality_components.get("sharpness", 0.35)
+        self.quality_contrast = quality_components.get("contrast", 0.30)
+        self.quality_exposure = quality_components.get("exposure", 0.25)
+        self.quality_noise = quality_components.get("noise", 0.10)
+
+        self.novelty_memory = scoring_config.get("novelty_memory", 64)
+        self.sharpness_range = scale_ranges.get("sharpness", [80.0, 300.0])
+        self.contrast_range = scale_ranges.get("contrast", [20.0, 80.0])
 
     @staticmethod
     def _scale(x: float, lo: float, hi: float) -> float:
         return float(max(0.0, min(1.0, (x - lo) / (hi - lo + 1e-9))))
 
     def _quality_score(self, f: FrameInfo) -> float:
-        s = self._scale(f.sharpness, 80.0, 300.0)
-        c = self._scale(f.contrast, 20.0, 80.0)
+        s = self._scale(f.sharpness, self.sharpness_range[0], self.sharpness_range[1])
+        c = self._scale(f.contrast, self.contrast_range[0], self.contrast_range[1])
         e = f.exposure_score
         n = f.noise_score
-        return 0.35 * s + 0.30 * c + 0.25 * e + 0.10 * n
+        return (
+            self.quality_sharpness * s
+            + self.quality_contrast * c
+            + self.quality_exposure * e
+            + self.quality_noise * n
+        )
 
     def _geom_score(self, f: FrameInfo) -> float:
         gx = cv2.Sobel(f.gray, cv2.CV_32F, 1, 0, ksize=3)
@@ -352,21 +395,24 @@ class MLFrameScorer:
         max_sim = max(sims) if sims else 0.0
         return float(max(0.0, min(1.0, 1.0 - max_sim)))
 
-    def score(self, frames: List[FrameInfo]) -> None:
+    def score(self, frames: List[FrameInfo], config: Optional[Dict] = None) -> None:
+        output_config = (config or {}).get("output", {})
+        log_intervals = output_config.get("log_intervals", {})
+        ml_scoring_interval = log_intervals.get("ml_scoring", 500)
+
         logger.debug(f"Starting ML scoring for {len(frames)} frames")
         for i, f in enumerate(frames):
-            if i % 500 == 0 and i > 0:
+            if i % ml_scoring_interval == 0 and i > 0:
                 logger.debug(f"ML scoring progress: {i}/{len(frames)} frames")
 
             q = self._quality_score(f)
             nov = self._novelty_score(f.embed)
-            geom = self._geom_score(f)
-            total = 0.4 * q + 0.45 * nov + 0.15 * geom
+            total = self.weight_quality * q + self.weight_novelty * nov
             f.ml_score = float(total)
-            f.subscores = {"quality": q, "content_novelty": nov, "geom": geom}
+            f.subscores = {"quality": q, "content_novelty": nov}
 
             logger.debug(
-                f"Frame {f.idx}: quality={q:.3f}, novelty={nov:.3f}, geom={geom:.3f} → ML_score={total:.3f}"
+                f"Frame {f.idx}: quality={q:.3f}, novelty={nov:.3f} → ML_score={total:.3f}"
             )
 
             if nov > self.novelty_threshold:
@@ -387,16 +433,16 @@ class AgroStratifier:
     YAML formát (viz curation_config.agro.yaml):
       stratification:
         axes:
-          altitude: [low, mid, high]
-          view: [nadir, oblique_low, oblique_high]
-          cover: [bare_soil, crop_sparse, crop_dense]
-          lighting: [dark, normal, bright]
+          altitude: [low, high]
+          view: [nadir, oblique]
+          cover: [sparse, dense]
+          lighting: [dark, bright]
         targets:
-          "altitude:low|view:nadir|cover:crop_dense|lighting:normal": 0.24
-          "*": 0.76
+          "altitude:low|view:nadir|cover:dense|lighting:bright": 0.25
+          "*": 0.75
         limits:
           windy_max_ratio: 0.15
-          bare_soil_max_ratio: 0.20
+          sparse_max_ratio: 0.30
     """
 
     def __init__(self, config: Dict):
@@ -404,15 +450,15 @@ class AgroStratifier:
         self.axes = sconf.get(
             "axes",
             {
-                "altitude": ["low", "mid", "high"],
-                "view": ["nadir", "oblique_low", "oblique_high"],
-                "cover": ["bare_soil", "crop_sparse", "crop_dense"],
-                "lighting": ["dark", "normal", "bright"],
+                "altitude": ["low", "high"],
+                "view": ["nadir", "oblique"],
+                "cover": ["sparse", "dense"],
+                "lighting": ["dark", "bright"],
             },
         )
         self.targets_raw: Dict[str, float] = sconf.get("targets", {"*": 1.0})
         self.limits = sconf.get(
-            "limits", {"windy_max_ratio": 0.15, "bare_soil_max_ratio": 0.20}
+            "limits", {"windy_max_ratio": 0.15, "sparse_max_ratio": 0.30}
         )
         self.counts: Dict[str, int] = defaultdict(int)
         self.total_selected: int = 0
@@ -466,28 +512,35 @@ class AgroStratifier:
         return f"altitude:{altitude}|view:{view}|cover:{cover}|lighting:{lighting}"
 
     def select(
-        self, frames_sorted: List[FrameInfo], target_size: int
+        self,
+        frames_sorted: List[FrameInfo],
+        target_size: Optional[int],
+        config: Optional[Dict] = None,
     ) -> List[FrameInfo]:
+        selection_config = (config or {}).get("selection", {})
+        stratified_split_ratio = selection_config.get("stratified_split_ratio", 0.5)
+        high_quality_threshold = selection_config.get("high_quality_threshold", 0.95)
+
         selected: List[FrameInfo] = []
         for f in frames_sorted:
-            if len(selected) >= target_size:
+            if target_size is not None and len(selected) >= target_size:
                 break
 
             # derive key and ratios
             a, v, c, l = f.strata  # type: ignore
             key = self.combo_key(a, v, c, l)
 
-            # enforce limits (example: bare_soil cap)
-            if c == "bare_soil":
-                if self._current_ratio(selected, cover="bare_soil") >= self.limits.get(
-                    "bare_soil_max_ratio", 1.0
+            # enforce limits (example: sparse cover cap)
+            if c == "sparse":
+                if self._current_ratio(selected, cover="sparse") >= self.limits.get(
+                    "sparse_max_ratio", 1.0
                 ):
                     continue
 
             # acceptance rule: under-target or very high quality
             curr_ratio = self._current_ratio(selected, key=key)
             target_ratio = self.targets.get(key, 0.0)
-            if curr_ratio < target_ratio or f.ml_score > 0.95:
+            if curr_ratio < target_ratio or f.ml_score > high_quality_threshold:
                 selected.append(f)
                 self.counts[key] += 1
                 self.total_selected += 1
@@ -514,7 +567,7 @@ class AgroStratifier:
 
 
 # -----------------------------------------------------------------------------
-# Quality-aware deduplikace (DBSCAN) + eps odhad
+# Quality-aware deduplikace (greedy) + cosine threshold
 # -----------------------------------------------------------------------------
 def auto_eps_from_adjacent_sims(
     frames: List[FrameInfo], quantile: float = 0.90
@@ -530,42 +583,78 @@ def auto_eps_from_adjacent_sims(
 
 
 def deduplicate_quality_first(
-    frames: List[FrameInfo], keep_frac_per_cluster: float = 0.10
+    frames: List[FrameInfo],
+    cosine_threshold: Optional[float] = None,
+    config: Optional[Dict] = None,
 ) -> List[FrameInfo]:
+    if cosine_threshold is None:
+        deduplication_config = (config or {}).get("deduplication", {})
+        cosine_threshold = deduplication_config.get("cosine_threshold", 0.85)
     if not frames:
         return []
-    if not HAVE_SKLEARN:
-        logger.warning("scikit-learn není k dispozici; greedy fallback dedup.")
-        selected: List[FrameInfo] = []
-        pivot: Optional[FrameInfo] = None
-        thr = 1.0 - auto_eps_from_adjacent_sims(frames, 0.90)
-        for f in frames:
-            if pivot is None:
-                selected.append(f)
-                pivot = f
-                continue
-            if cosine_similarity(f.embed, pivot.embed) < thr:
-                selected.append(f)
-                pivot = f
-        return selected
 
-    X = np.stack([f.embed for f in frames], axis=0)
-    eps = auto_eps_from_adjacent_sims(frames, 0.90)
-    clustering = DBSCAN(eps=eps, min_samples=2, metric="cosine").fit(X)
-    labels = clustering.labels_
+    # Simple greedy deduplication with fixed cosine threshold
+    selected: List[FrameInfo] = []
+    for f in sorted(frames, key=lambda x: x.ml_score, reverse=True):
+        # Check if similar to any already selected frame
+        is_duplicate = False
+        for s in selected:
+            if cosine_similarity(f.embed, s.embed) > cosine_threshold:
+                is_duplicate = True
+                break
+        if not is_duplicate:
+            selected.append(f)
 
-    clusters: Dict[int, List[FrameInfo]] = defaultdict(list)
+    return selected
+
+
+def deduplicate_dbscan(
+    frames: List[FrameInfo],
+    eps: Optional[float] = None,
+    min_samples: int = 1,
+    config: Optional[Dict] = None,
+) -> List[FrameInfo]:
+    """Deduplicate using DBSCAN on frame embeddings.
+
+    For each DBSCAN cluster we pick the frame with highest ml_score.
+    Accepts `eps` in cosine-distance space (i.e. 0..2 for cosine metric as used
+    via sklearn metric 'cosine' where distance = 1 - cosine_similarity). If
+    eps is None we fall back to `auto_eps_from_adjacent_sims` computed on
+    frames sorted by time (approx adjacency heuristic).
+    """
+    if not frames:
+        return []
+
+    # prepare eps
+    dedup_conf = (config or {}).get("deduplication", {})
+    if eps is None:
+        try:
+            eps = dedup_conf.get("eps", None)
+            if eps is None:
+                eps = auto_eps_from_adjacent_sims(frames)
+        except Exception:
+            eps = 0.1
+
+    # build embedding matrix
+    X = np.vstack([f.embed for f in frames]).astype(np.float32)
+
+    # use sklearn DBSCAN with cosine metric (returns distance = 1 - cosine)
+    db = DBSCAN(eps=eps, min_samples=int(min_samples), metric="cosine")
+    labels = db.fit_predict(X)
+
+    clusters: Dict[int, List[Tuple[FrameInfo, float]]] = {}
     for f, lab in zip(frames, labels):
-        clusters[lab].append(f)
+        clusters.setdefault(int(lab), []).append((f, f.ml_score))
 
     selected: List[FrameInfo] = []
+    # for noise points label == -1 -> treat each as singleton cluster
     for lab, items in clusters.items():
-        if lab == -1:
-            selected.extend(items)  # singletons
-            continue
-        items_sorted = sorted(items, key=lambda x: x.ml_score, reverse=True)
-        k = max(1, int(round(len(items_sorted) * keep_frac_per_cluster)))
-        selected.extend(items_sorted[:k])
+        # pick highest-ml_score item in cluster
+        best = max(items, key=lambda t: t[1])[0]
+        selected.append(best)
+
+    # preserve ordering by ml_score descending
+    selected = sorted(selected, key=lambda x: x.ml_score, reverse=True)
     return selected
 
 
@@ -576,12 +665,14 @@ def curate_video(
     video_path: str,
     out_dir: str,
     stride: int,
-    target_size: int,
+    target_size: Optional[int],
     min_sharpness: float,
     min_contrast: float,
     novelty_threshold: float,
     manifest_name: str = "manifest.json",
     config: Optional[Dict] = None,
+    dedup_method: Optional[str] = None,
+    run_params: Optional[Dict] = None,
 ) -> List[FrameInfo]:
     logger.info(f"Starting video curation: {video_path}")
     logger.info(f"Output directory: {out_dir}")
@@ -593,21 +684,22 @@ def curate_video(
     os.makedirs(out_dir, exist_ok=True)
 
     # 1) Pre-filter
-    logger.info("Step 1/7: Pre-filtering frames...")
+    logger.info("Step 1/5: Pre-filtering frames...")
     candidates = prefilter_candidates(
         video_path=video_path,
         stride=stride,
         min_sharpness=min_sharpness,
         min_contrast=min_contrast,
+        config=config,
     )
     if not candidates:
         logger.info("Žádní kandidáti nesplnili pre-filter.")
         return []
 
     # 2) ML skórování
-    logger.info("Step 2/7: Computing ML scores...")
-    scorer = MLFrameScorer(novelty_memory=64, novelty_threshold=novelty_threshold)
-    scorer.score(candidates)
+    logger.info("Step 2/5: Computing ML scores...")
+    scorer = MLFrameScorer(novelty_threshold=novelty_threshold, config=config)
+    scorer.score(candidates, config=config)
 
     ml_scores = [f.ml_score for f in candidates]
     logger.debug(
@@ -615,50 +707,81 @@ def curate_video(
     )
 
     # 3) Binning agro os (potřebujeme kvantily pro altitude)
-    logger.info("Step 3/7: Computing agro stratification...")
+    logger.info("Step 3/5: Computing agro stratification...")
     hf_vals = np.array([f.hf_energy for f in candidates], dtype=np.float32)
-    q33, q66 = np.quantile(hf_vals, [0.33, 0.66]).tolist()
-    logger.debug(f"Altitude quantiles: q33={q33:.2f}, q66={q66:.2f}")
+    q50 = float(np.quantile(hf_vals, 0.5))
+    logger.debug(f"Altitude quantile: q50={q50:.2f}")
 
     strata_counts = defaultdict(int)
+    stratification_config = (config or {}).get("stratification", {})
+    thresholds = stratification_config.get("thresholds", {})
+    view_threshold = thresholds.get("view_entropy", 1.8)
+    cover_threshold = thresholds.get("cover_ratio", 0.5)
+    lighting_threshold = thresholds.get("lighting_mean", 115)
+
     for f in candidates:
-        a = bin_altitude(f.hf_energy, q33, q66)
-        v = bin_view(f.view_entropy_val, t1=1.6, t2=1.9)
-        c = bin_cover(f.green_cover)
-        l = bin_lighting(f.lighting_mean)
+        a = bin_altitude(f.hf_energy, q50)
+        v = bin_view(f.view_entropy_val, t=view_threshold)
+        c = bin_cover(f.green_cover, threshold=cover_threshold)
+        l = bin_lighting(f.lighting_mean, threshold=lighting_threshold)
         f.strata = (a, v, c, l)
         strata_counts[f.strata] += 1
 
     logger.debug(f"Strata distribution: {dict(strata_counts)}")
 
-    # 4) Stratifikace z YAML
-    logger.info("Step 4/7: Applying stratified selection...")
-    strat = AgroStratifier(config or {})
+    # 4) Výběr podle target_size nebo threshold
     cand_sorted = sorted(candidates, key=lambda x: x.ml_score, reverse=True)
-    first_batch = strat.select(cand_sorted, target_size=max(1, target_size // 2))
-    logger.debug(
-        f"Stratified selection: {len(first_batch)} frames selected from first batch"
-    )
+    if target_size is None:
+        # Threshold-based selection: top % of candidates
+        selection_config = (config or {}).get("selection", {})
+        threshold_ratio = selection_config.get("threshold_selection_ratio", 0.25)
+        threshold_count = max(1, int(len(candidates) * threshold_ratio))
+        logger.info(
+            f"Step 4/5: Applying threshold-based selection (top {threshold_count} frames, {threshold_ratio:.1%} of candidates)..."
+        )
+        prelim = cand_sorted[:threshold_count]
+        logger.debug(f"Threshold selection: {len(prelim)} frames selected")
+    else:
+        # Stratified selection
+        logger.info("Step 4/5: Applying stratified selection...")
+        strat = AgroStratifier(config or {})
+        first_batch = strat.select(cand_sorted, max(1, target_size // 2), config=config)
+        logger.debug(
+            f"Stratified selection: {len(first_batch)} frames selected from first batch"
+        )
 
-    # 5) Doplnění top kvality
-    logger.info("Step 5/7: Adding top quality frames...")
-    remaining = [f for f in cand_sorted if f not in first_batch]
-    top_quality = remaining[: max(1, target_size - len(first_batch))]
-    prelim = first_batch + top_quality
-    logger.debug(
-        f"Added {len(top_quality)} top quality frames, preliminary total: {len(prelim)}"
-    )
+        # 5) Doplnění top kvality
+        logger.info("Step 5/5: Adding top quality frames...")
+        remaining = [f for f in cand_sorted if f not in first_batch]
+        top_quality = remaining[: max(1, target_size - len(first_batch))]
+        prelim = first_batch + top_quality
+        logger.debug(
+            f"Added {len(top_quality)} top quality frames, preliminary total: {len(prelim)}"
+        )
 
-    # 6) Dedup
-    logger.info("Step 6/7: Deduplicating frames...")
-    eps_used = auto_eps_from_adjacent_sims(prelim, 0.90) if prelim else 0.1
-    logger.debug(f"Using DBSCAN eps={eps_used:.3f} for deduplication")
-    final = deduplicate_quality_first(prelim, keep_frac_per_cluster=0.10)
+    # 4) Dedup
+    logger.info("Step 4/5: Deduplicating frames...")
+    deduplication_config = (config or {}).get("deduplication", {})
+    cosine_threshold = deduplication_config.get("cosine_threshold", 0.85)
+    # resolve method: CLI-provided dedup_method takes precedence; otherwise use config, default to 'greedy'
+    method = (dedup_method or deduplication_config.get("method") or "greedy").lower()
+    if method == "dbscan":
+        eps = deduplication_config.get("eps", None)
+        min_samples = int(deduplication_config.get("min_samples", 1))
+        logger.debug(f"Using DBSCAN deduplication eps={eps} min_samples={min_samples}")
+        final = deduplicate_dbscan(
+            prelim, eps=eps, min_samples=min_samples, config=config
+        )
+    else:
+        logger.debug(
+            f"Using greedy deduplication with cosine threshold {cosine_threshold}"
+        )
+        final = deduplicate_quality_first(prelim, config=config)
     # sort by score
     final = sorted(final, key=lambda x: x.ml_score, reverse=True)
 
-    # If deduplication removed too many frames, refill from remaining candidates
-    if len(final) < target_size:
+    # If deduplication removed too many frames, refill from remaining candidates (only if target_size specified)
+    if target_size is not None and len(final) < target_size:
         logger.debug(
             f"Deduplication reduced count ({len(final)}) below target ({target_size}), attempting refill"
         )
@@ -672,24 +795,30 @@ def curate_video(
             final.extend(to_add)
             logger.debug(f"Refilled {len(to_add)} frames to reach target_size")
 
-    # ensure final length does not exceed target
-    final = final[:target_size]
+    # ensure final length does not exceed target (only if target_size specified)
+    if target_size is not None:
+        final = final[:target_size]
     logger.debug(f"Deduplication: {len(prelim)} → {len(final)} frames")
 
-    # 7) Uložení
-    logger.info("Step 7/7: Saving frames and manifest...")
+    # 5) Uložení
+    logger.info("Step 5/5: Saving frames and manifest...")
+    output_config = (config or {}).get("output", {})
+    jpeg_quality = output_config.get("jpeg_quality", 95)
+    log_interval = output_config.get("log_intervals", {}).get("frames_saved", 100)
+
     paths: List[str] = []
     for i, f in enumerate(final):
         fname = f"frame_{i:06d}_src{f.idx:06d}_t{f.t_sec:010.3f}.jpg"
         path = os.path.join(out_dir, fname)
-        cv2.imwrite(path, f.bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        cv2.imwrite(path, f.bgr, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
         paths.append(path)
-        if (i + 1) % 100 == 0:
+        if (i + 1) % log_interval == 0:
             logger.debug(f"Saved {i + 1}/{len(final)} frames")
 
     manifest = {
         "video": os.path.abspath(video_path),
         "count_candidates": len(candidates),
+        "run_params": run_params or {},
         "count_selected": len(final),
         "out_dir": os.path.abspath(out_dir),
         "axes": ["altitude", "view", "cover", "lighting"],
@@ -794,7 +923,7 @@ def print_human_readable_statistics(
     total_candidates = manifest.get("count_candidates", 0)
     total_selected = manifest.get("count_selected", 0)
     frames = manifest.get("frames", [])
-    target_size = int(params.target_size) if params else None
+    target_size = params.target_size if params else None
 
     print(f"🎬 Video: {os.path.basename(manifest.get('video', 'Unknown'))}")
     print(f"📁 Output: {manifest.get('out_dir', 'Unknown')}")
@@ -808,15 +937,33 @@ def print_human_readable_statistics(
     )
 
     if params:
-        print(f"\n⚙️ PARAMETERS USED:")
+        print(f"\n⚙️ PARAMETERS (explicit or defaults):")
+        # prefer run_params from manifest when available
+        run_params = manifest.get("run_params") or {}
         print(f"   Config file:         {params.config or 'None'}")
-        print(f"   Stride:              {params.stride}")
-        print(f"   Target size:         {params.target_size}")
-        print(f"   Min sharpness:       {params.min_sharpness}")
-        print(f"   Min contrast:        {params.min_contrast}")
-        print(f"   Novelty threshold:   {params.novelty_threshold}")
 
-    if target_size and total_candidates < target_size:
+        def fmt(k):
+            r = run_params.get(k, {})
+            v = r.get("value") if r else getattr(params, k, None)
+            src = (
+                r.get("source")
+                if r
+                else ("cli" if getattr(params, k, None) is not None else "default")
+            )
+            if k == "target_size":
+                disp = v if v is not None else "None (threshold-based)"
+            else:
+                disp = v
+            return f"{disp} (source={src})"
+
+        print(f"   Stride:              {fmt('stride')}")
+        print(f"   Target size:         {fmt('target_size')}")
+        print(f"   Min sharpness:       {fmt('min_sharpness')}")
+        print(f"   Min contrast:        {fmt('min_contrast')}")
+        print(f"   Novelty threshold:   {fmt('novelty_threshold')}")
+        print(f"   Dedup method:        {fmt('dedup_method')}")
+
+    if target_size is not None and total_candidates < target_size:
         print("\n" + "⚠️" + " WARNING: INSUFFICIENT CANDIDATES " + "⚠️")
         print(
             f"The number of candidates ({total_candidates}) was less than the target size ({target_size})."
@@ -850,7 +997,6 @@ def print_human_readable_statistics(
         novelty_scores = [
             fr["subscores"]["content_novelty"] for fr in frames if fr.get("subscores")
         ]
-        geom_scores = [fr["subscores"]["geom"] for fr in frames if fr.get("subscores")]
 
         if quality_scores:
             print(f"\n📏 SCORE COMPONENTS:")
@@ -859,9 +1005,6 @@ def print_human_readable_statistics(
             )
             print(
                 f"   Novelty: {np.mean(novelty_scores):.3f} ± {np.std(novelty_scores):.3f}"
-            )
-            print(
-                f"   Geometry: {np.mean(geom_scores):.3f} ± {np.std(geom_scores):.3f}"
             )
 
     # Stratification analysis
@@ -959,7 +1102,12 @@ def build_argparser(defaults: Dict = {}) -> argparse.ArgumentParser:
         "--config", default=None, help="Cesta k YAML konfiguraci (volitelné)"
     )
     p.add_argument("--stride", type=int, help="Vybírat každý N-tý snímek")
-    p.add_argument("--target-size", type=int, help="Cílový počet vybraných snímků")
+    p.add_argument(
+        "--target-size",
+        type=int,
+        default=None,
+        help="Cílový počet vybraných snímků (None = threshold-based selection)",
+    )
     p.add_argument(
         "--min-sharpness",
         type=float,
@@ -970,6 +1118,11 @@ def build_argparser(defaults: Dict = {}) -> argparse.ArgumentParser:
         "--novelty-threshold",
         type=float,
         help="Práh pro přidání snímku do prototypů pro výpočet novelty (0..1)",
+    )
+    p.add_argument(
+        "--dedup-method",
+        choices=["greedy", "dbscan"],
+        help="Metoda deduplikace: 'greedy' (výchozí) nebo 'dbscan'",
     )
     p.add_argument("--manifest", help="Název manifest JSON")
     p.add_argument("--debug", action="store_true", help="Enable debug logging")
@@ -1018,18 +1171,70 @@ def main():
     else:
         logger.info("Using default configuration")
 
+    # Collect run parameters with source (cli vs config/default)
+    import sys
+
+    defaults_from_conf = defaults or {}
+    run_params: Dict[str, Dict[str, object]] = {}
+    # list of parameters to report
+    keys = [
+        "out",
+        "stride",
+        "target_size",
+        "min_sharpness",
+        "min_contrast",
+        "novelty_threshold",
+        "dedup_method",
+        "manifest",
+    ]
+    # Build a mapping from dest to option strings
+    dest_to_opts = {}
+    for action in ap._actions:
+        if action.option_strings:
+            for opt in action.option_strings:
+                dest_to_opts.setdefault(action.dest, []).append(opt)
+    # Build a set of CLI-specified dests
+    cli_dests = set()
+    for i, arg in enumerate(sys.argv[1:]):
+        if arg.startswith("-"):
+            for dest, opts in dest_to_opts.items():
+                if arg in opts:
+                    cli_dests.add(dest)
+    for k in keys:
+        dest = k
+        val = getattr(
+            args, dest if hasattr(args, dest) else dest.replace("-", "_"), None
+        )
+        # normalize explicit null from YAML to Python None
+        if val == "null":
+            val = None
+        if val is None and k in defaults_from_conf:
+            val = defaults_from_conf.get(k)
+        # Determine source
+        if dest in cli_dests:
+            source = "cli"
+        elif k in defaults_from_conf:
+            source = "config"
+        else:
+            source = "default"
+        run_params[k] = {"value": val, "source": source}
+
+    logger.info("Run parameters: %s", {k: v["value"] for k, v in run_params.items()})
+
     # Run the curation with timing
     start_time = time.time()
     final_frames = curate_video(
         video_path=args.video,
         out_dir=args.out,
         stride=int(args.stride),
-        target_size=int(args.target_size),
+        target_size=args.target_size,
         min_sharpness=float(args.min_sharpness),
         min_contrast=float(args.min_contrast),
         novelty_threshold=float(args.novelty_threshold),
         manifest_name=str(args.manifest),
         config=conf,
+        dedup_method=(args.dedup_method if hasattr(args, "dedup_method") else None),
+        run_params=run_params,
     )
     elapsed = time.time() - start_time
 

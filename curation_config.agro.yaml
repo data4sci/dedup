@@ -3,26 +3,64 @@ defaults:
   out: "curated_out"
   manifest: "manifest.json"
   stride: 2
-  target_size: 500
+  dedup_method: "greedy"
+  target_size: null # Default: None = threshold-based selection (configurable % of candidates)
   min_sharpness: 80.0
   min_contrast: 20.0
   novelty_threshold: 0.3
 
+scoring:
+  weights:
+    quality: 0.5
+    content_novelty: 0.5
+  quality_components:
+    sharpness: 0.35
+    contrast: 0.30
+    exposure: 0.25
+    noise: 0.10
+  novelty_memory: 64
+  scale_ranges:
+    sharpness: [80.0, 300.0]
+    contrast: [20.0, 80.0]
+
+embedding:
+  hsv_bins: [16, 16, 16]
+  lowres_size: [64, 36]
+
+proxies:
+  view_entropy_bins: 8
+  green_cover_threshold: 0.6
+
+selection:
+  stratified_split_ratio: 0.5
+  high_quality_threshold: 0.95
+  threshold_selection_ratio: 0.25
+
+deduplication:
+  cosine_threshold: 0.85
+  method: greedy
+
+output:
+  jpeg_quality: 95
+  log_intervals:
+    frames_processed: 1000
+    ml_scoring: 500
+    frames_saved: 100
+
 stratification:
   axes:
-    altitude: [low, mid, high] # letová výška
-    view: [nadir, oblique_low, oblique_high] # typ pohledu: shora, šikmý nízký, šikmý vysoký
-    cover: [bare_soil, crop_sparse, crop_dense] # typ pokryvu: holá půda, řídká vegetace, hustá vegetace
-    lighting: [dark, normal, bright] # osvětlení scény: tmavé, normální, světlé
+    altitude: [low, high] # letová výška
+    view: [nadir, oblique] # typ pohledu: shora, šikmý
+    cover: [sparse, dense] # typ pokryvu: řídká vegetace, hustá vegetace
+    lighting: [dark, bright] # osvětlení scény: tmavé, světlé
 
   # Cílové podíly (součet -> 1.0). '*' se rozdělí rovnoměrně mezi nezmíněné kombinace.
   targets:
-    "altitude:low|view:nadir|cover:crop_dense|lighting:normal": 0.24
-    "altitude:mid|view:nadir|cover:crop_dense|lighting:normal": 0.16
-    # ostatní kombinace dostanou rovnoměrně zbylých 0.60
-    "*": 0.60
+    "altitude:low|view:nadir|cover:dense|lighting:bright": 0.25
+
+    # ostatní kombinace dostanou rovnoměrně zbylých 0.75
+    "*": 0.75
 
   # Limity / ochrany proti dominanci špatně užitečných strat
   limits:
-    bare_soil_max_ratio: 0.20 # max 20 % snímků z holé půdy
-    windy_max_ratio: 0.15 # (placeholder; pokud doplníš motion proxy)
+    sparse_max_ratio: 0.30 # max 30 % snímků z řídké vegetace
