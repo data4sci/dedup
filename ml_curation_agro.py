@@ -1142,6 +1142,11 @@ def main():
     ap = build_argparser(defaults=defaults)
     args = ap.parse_args()
 
+    # Set default output folder if not specified
+    if args.out is None:
+        video_base = os.path.splitext(os.path.basename(args.video))[0]
+        args.out = os.path.join("data", "output", video_base)
+
     # configure logging
     level = logging.DEBUG if getattr(args, "debug", False) else logging.INFO
     log_path = os.path.join(args.out, "curation.log")

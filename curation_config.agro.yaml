@@ -1,6 +1,6 @@
 # Agro stratification config (example)
 defaults:
-  out: "curated_out"
+  out: null # Default: None = output folder will be set to input video filename (without extension)
   manifest: "manifest.json"
   stride: 2
   dedup_method: "greedy"
