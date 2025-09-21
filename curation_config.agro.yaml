@@ -1,4 +1,13 @@
 # Agro stratification config (example)
+defaults:
+  out: "curated_out"
+  manifest: "manifest.json"
+  stride: 2
+  target_size: 500
+  min_sharpness: 80.0
+  min_contrast: 20.0
+  novelty_threshold: 0.3
+
 stratification:
   axes:
     altitude: [low, mid, high] # letová výška

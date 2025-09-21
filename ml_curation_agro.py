@@ -315,9 +315,10 @@ def prefilter_candidates(
 # ML skórování (bez DL)
 # -----------------------------------------------------------------------------
 class MLFrameScorer:
-    def __init__(self, novelty_memory: int = 64):
+    def __init__(self, novelty_memory: int = 64, novelty_threshold: float = 0.3):
         self.prototypes: List[np.ndarray] = []
         self.novelty_memory = int(novelty_memory)
+        self.novelty_threshold = novelty_threshold
 
     @staticmethod
     def _scale(x: float, lo: float, hi: float) -> float:
@@ -368,7 +369,7 @@ class MLFrameScorer:
                 f"Frame {f.idx}: quality={q:.3f}, novelty={nov:.3f}, geom={geom:.3f} → ML_score={total:.3f}"
             )
 
-            if nov > 0.3:
+            if nov > self.novelty_threshold:
                 self.prototypes.append(f.embed)
                 logger.debug(f"Frame {f.idx} added to prototypes (novelty={nov:.3f})")
 
@@ -574,17 +575,19 @@ def deduplicate_quality_first(
 def curate_video(
     video_path: str,
     out_dir: str,
-    stride: int = 1,
-    target_size: int = 500,
-    min_sharpness: float = 80.0,
-    min_contrast: float = 20.0,
+    stride: int,
+    target_size: int,
+    min_sharpness: float,
+    min_contrast: float,
+    novelty_threshold: float,
     manifest_name: str = "manifest.json",
     config: Optional[Dict] = None,
 ) -> List[FrameInfo]:
     logger.info(f"Starting video curation: {video_path}")
     logger.info(f"Output directory: {out_dir}")
     logger.info(
-        f"Parameters: stride={stride}, target_size={target_size}, min_sharpness={min_sharpness}, min_contrast={min_contrast}"
+        f"Parameters: stride={stride}, target_size={target_size}, min_sharpness={min_sharpness}, "
+        f"min_contrast={min_contrast}, novelty_threshold={novelty_threshold}"
     )
 
     os.makedirs(out_dir, exist_ok=True)
@@ -603,7 +606,7 @@ def curate_video(
 
     # 2) ML skórování
     logger.info("Step 2/7: Computing ML scores...")
-    scorer = MLFrameScorer(novelty_memory=64)
+    scorer = MLFrameScorer(novelty_memory=64, novelty_threshold=novelty_threshold)
     scorer.score(candidates)
 
     ml_scores = [f.ml_score for f in candidates]
@@ -770,7 +773,11 @@ def curate_video(
     return final
 
 
-def print_human_readable_statistics(manifest_path: str, elapsed: float = None) -> None:
+def print_human_readable_statistics(
+    manifest_path: str,
+    elapsed: float = None,
+    params: Optional[argparse.Namespace] = None,
+) -> None:
     """Print comprehensive human-readable statistics from manifest.json"""
     try:
         with open(manifest_path, "r", encoding="utf-8") as f:
@@ -787,6 +794,7 @@ def print_human_readable_statistics(manifest_path: str, elapsed: float = None) -
     total_candidates = manifest.get("count_candidates", 0)
     total_selected = manifest.get("count_selected", 0)
     frames = manifest.get("frames", [])
+    target_size = int(params.target_size) if params else None
 
     print(f"🎬 Video: {os.path.basename(manifest.get('video', 'Unknown'))}")
     print(f"📁 Output: {manifest.get('out_dir', 'Unknown')}")
@@ -798,6 +806,28 @@ def print_human_readable_statistics(manifest_path: str, elapsed: float = None) -
         if total_candidates > 0
         else "Selection ratio: N/A"
     )
+
+    if params:
+        print(f"\n⚙️ PARAMETERS USED:")
+        print(f"   Config file:         {params.config or 'None'}")
+        print(f"   Stride:              {params.stride}")
+        print(f"   Target size:         {params.target_size}")
+        print(f"   Min sharpness:       {params.min_sharpness}")
+        print(f"   Min contrast:        {params.min_contrast}")
+        print(f"   Novelty threshold:   {params.novelty_threshold}")
+
+    if target_size and total_candidates < target_size:
+        print("\n" + "⚠️" + " WARNING: INSUFFICIENT CANDIDATES " + "⚠️")
+        print(
+            f"The number of candidates ({total_candidates}) was less than the target size ({target_size})."
+        )
+        print(
+            "To get more candidates, consider relaxing pre-filtering criteria (e.g., lower '--min-sharpness')"
+        )
+        print(
+            "or adjusting the '--novelty-threshold' to include more frames in the initial selection."
+        )
+        print("=" * 80)
 
     if not frames:
         print("⚠️ No frames found in manifest.")
@@ -918,36 +948,45 @@ def load_yaml(path: Optional[str]) -> Dict:
 # -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
-def build_argparser() -> argparse.ArgumentParser:
+def build_argparser(defaults: Dict = {}) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="ML-Driven Frame Curation — Agro Stratification (MVP).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("video", help="Vstupní video soubor")
-    p.add_argument("-o", "--out", default="curated_out", help="Výstupní složka")
+    p.add_argument("-o", "--out", help="Výstupní složka")
     p.add_argument(
         "--config", default=None, help="Cesta k YAML konfiguraci (volitelné)"
     )
-    p.add_argument("--stride", type=int, default=2, help="Vybírat každý N-tý snímek")
-    p.add_argument(
-        "--target-size", type=int, default=500, help="Cílový počet vybraných snímků"
-    )
+    p.add_argument("--stride", type=int, help="Vybírat každý N-tý snímek")
+    p.add_argument("--target-size", type=int, help="Cílový počet vybraných snímků")
     p.add_argument(
         "--min-sharpness",
         type=float,
-        default=80.0,
         help="Minimální ostrost (Variance of Laplacian)",
     )
+    p.add_argument("--min-contrast", type=float, help="Minimální kontrast (std gray)")
     p.add_argument(
-        "--min-contrast", type=float, default=20.0, help="Minimální kontrast (std gray)"
+        "--novelty-threshold",
+        type=float,
+        help="Práh pro přidání snímku do prototypů pro výpočet novelty (0..1)",
     )
-    p.add_argument("--manifest", default="manifest.json", help="Název manifest JSON")
+    p.add_argument("--manifest", help="Název manifest JSON")
     p.add_argument("--debug", action="store_true", help="Enable debug logging")
+    p.set_defaults(**defaults)
     return p
 
 
 def main():
-    ap = build_argparser()
+    # Load config first to get defaults
+    temp_parser = argparse.ArgumentParser(add_help=False)
+    temp_parser.add_argument("--config", default=None)
+    temp_args, _ = temp_parser.parse_known_args()
+
+    conf = load_yaml(temp_args.config)
+    defaults = conf.get("defaults", {})
+
+    ap = build_argparser(defaults=defaults)
     args = ap.parse_args()
 
     # configure logging
@@ -974,7 +1013,6 @@ def main():
     if args.debug:
         logger.info("Debug mode enabled - detailed logging will be shown")
 
-    conf = load_yaml(args.config)
     if args.config:
         logger.info(f"Loaded configuration from: {args.config}")
     else:
@@ -989,6 +1027,7 @@ def main():
         target_size=int(args.target_size),
         min_sharpness=float(args.min_sharpness),
         min_contrast=float(args.min_contrast),
+        novelty_threshold=float(args.novelty_threshold),
         manifest_name=str(args.manifest),
         config=conf,
     )
@@ -997,7 +1036,7 @@ def main():
     # Print human-readable statistics
     manifest_path = os.path.join(args.out, args.manifest)
     if os.path.exists(manifest_path):
-        print_human_readable_statistics(manifest_path, elapsed)
+        print_human_readable_statistics(manifest_path, elapsed=elapsed, params=args)
     else:
         logger.warning(f"Manifest file not found: {manifest_path}")
 

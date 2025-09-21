@@ -6,17 +6,23 @@ Tato aplikace slouží k **automatické kuraci snímků z droních videí** v ag
 
 ### Použití z CLI
 
+Všechny parametry lze konfigurovat v `curation_config.agro.yaml` v sekci `defaults`. Hodnoty zadané přes CLI mají vždy přednost.
+
 ```bash
 pip install opencv-python numpy scikit-learn pyyaml
-python ml_curation_agro.py input.mp4 -o curated_out \
+
+# Spuštění s konfigurací z YAML souboru
+python ml_curation_agro.py input.mp4 --config curation_config.agro.yaml
+
+# Přepsání konkrétních parametrů přes CLI
+python ml_curation_agro.py input.mp4 -o curated_out_new \
   --config curation_config.agro.yaml \
-  --stride 2 --target-size 600 \
-  --min-sharpness 80 --min-contrast 20
+  --target-size 100 --novelty-threshold 0.5
 ```
 
 * `input.mp4` – vstupní video
-* `curated_out/` – výstupní složka se snímky a `manifest.json`
-* `curation_config.agro.yaml` – YAML konfigurace s cílovými podíly a limity stratifikace
+* `--config curation_config.agro.yaml` – YAML konfigurace, která nyní obsahuje i výchozí hodnoty pro parametry jako `out`, `manifest`, `target_size`, `stride`, `min_sharpness`, `min_contrast` a `novelty_threshold`.
+* Argumenty zadané v příkazové řádce (např. `-o curated_out_new`) přepíší výchozí hodnoty z YAML souboru.
 
 ---
 
