@@ -20,7 +20,7 @@ Závislosti:
     pip install opencv-python numpy scikit-learn pyyaml
 
 Použití:
-    python ml_curation_agro.py input.mp4 -o out_dir --config curation_config.agro.yaml
+    python balanced_frame_extractor.py input.mp4 -o out_dir --config config.yaml
 """
 from __future__ import annotations
 
@@ -430,7 +430,7 @@ class MLFrameScorer:
 class AgroStratifier:
     """
     Převádí kontinuální proxy -> binned straty a udržuje výběr podle YAML targetů.
-    YAML formát (viz curation_config.agro.yaml):
+    YAML formát (viz config.yaml):
       stratification:
         axes:
           altitude: [low, high]
@@ -950,11 +950,32 @@ def print_human_readable_statistics(
                 if r
                 else ("cli" if getattr(params, k, None) is not None else "default")
             )
+            # Determine config file name if source is config
+            config_file = getattr(params, "config", None)
+            config_file = config_file if config_file else "config.yaml"
+            if src == "cli":
+                src_disp = "cli"
+            else:
+                src_disp = config_file
+            # Show actual default value from config.yaml if present
+            if v is None:
+                # Try to get from config defaults
+                defaults = {}
+                try:
+                    import yaml
+
+                    with open(config_file, "r", encoding="utf-8") as f:
+                        conf = yaml.safe_load(f)
+                        defaults = conf.get("defaults", {})
+                except Exception:
+                    defaults = {}
+                v = defaults.get(k, None)
+                src_disp = config_file
             if k == "target_size":
                 disp = v if v is not None else "None (threshold-based)"
             else:
                 disp = v
-            return f"{disp} (source={src})"
+            return f"{disp} (source={src_disp})"
 
         print(f"   Stride:              {fmt('stride')}")
         print(f"   Target size:         {fmt('target_size')}")
@@ -1226,17 +1247,26 @@ def main():
 
     logger.info("Run parameters: %s", {k: v["value"] for k, v in run_params.items()})
 
+    # Ensure all parameters have valid values (fallback if None)
+    stride = args.stride if args.stride is not None else 1
+    min_sharpness = args.min_sharpness if args.min_sharpness is not None else 80.0
+    min_contrast = args.min_contrast if args.min_contrast is not None else 20.0
+    novelty_threshold = (
+        args.novelty_threshold if args.novelty_threshold is not None else 0.3
+    )
+    manifest_name = args.manifest if args.manifest is not None else "manifest.json"
+
     # Run the curation with timing
     start_time = time.time()
     final_frames = curate_video(
         video_path=args.video,
         out_dir=args.out,
-        stride=int(args.stride),
+        stride=int(stride),
         target_size=args.target_size,
-        min_sharpness=float(args.min_sharpness),
-        min_contrast=float(args.min_contrast),
-        novelty_threshold=float(args.novelty_threshold),
-        manifest_name=str(args.manifest),
+        min_sharpness=float(min_sharpness),
+        min_contrast=float(min_contrast),
+        novelty_threshold=float(novelty_threshold),
+        manifest_name=str(manifest_name),
         config=conf,
         dedup_method=(args.dedup_method if hasattr(args, "dedup_method") else None),
         run_params=run_params,
@@ -1244,7 +1274,7 @@ def main():
     elapsed = time.time() - start_time
 
     # Print human-readable statistics
-    manifest_path = os.path.join(args.out, args.manifest)
+    manifest_path = os.path.join(args.out, manifest_name)
     if os.path.exists(manifest_path):
         print_human_readable_statistics(manifest_path, elapsed=elapsed, params=args)
     else:
