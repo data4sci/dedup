@@ -38,7 +38,9 @@ selection:
 
 deduplication:
   cosine_threshold: 0.85
-  method: greedy
+  method: "greedy"
+  eps: null # Auto-calculated if null, used for DBSCAN method
+  min_samples: 1
 
 output:
   jpeg_quality: 95
@@ -54,6 +56,12 @@ stratification:
     cover: [sparse, dense] # typ pokryvu: řídká vegetace, hustá vegetace
     lighting: [dark, bright] # osvětlení scény: tmavé, světlé
 
+  # Prahové hodnoty pro binning agro proxy hodnot
+  thresholds:
+    view_entropy: 1.8 # práh pro rozdělení nadir/oblique
+    cover_ratio: 0.5 # práh pro rozdělení sparse/dense
+    lighting_mean: 115 # práh pro rozdělení dark/bright
+
   # Cílové podíly (součet -> 1.0). '*' se rozdělí rovnoměrně mezi nezmíněné kombinace.
   targets:
     "altitude:low|view:nadir|cover:dense|lighting:bright": 0.25
@@ -64,3 +72,32 @@ stratification:
   # Limity / ochrany proti dominanci špatně užitečných strat
   limits:
     sparse_max_ratio: 0.30 # max 30 % snímků z řídké vegetace
+
+# Parametry pro zpracování obrazu a OpenCV operace
+image_processing:
+  # Sobel operátor parametry
+  sobel_kernel_size: 3
+
+  # Gaussian blur parametry
+  gaussian_kernel_size: [3, 3]
+  gaussian_sigma: 0
+
+  # Noise score parametry
+  noise_scaling_factor: 25.0
+
+  # Exposure scoring parametry
+  exposure:
+    center_value: 128.0 # ideální střední hodnota
+    underexposure_bins: 10 # počet bins pro underexposure (hist[:10])
+    overexposure_start: 246 # start bin pro overexposure (hist[246:])
+    center_penalty_weight: 0.6
+    clip_penalty_weight: 0.4
+    clip_multiplier: 2.0
+
+# Matematické konstanty a fallback hodnoty
+constants:
+  fallback_fps: 30.0 # fallback FPS pokud nelze detekovat z videa
+  dbscan_auto_eps_quantile: 0.90 # kvantil pro auto-výpočet DBSCAN eps
+  dbscan_eps_bounds: [0.02, 0.30] # min/max bounds pro auto-eps
+  epsilon: 1e-9 # malá hodnota pro prevenci dělení nulou
+  epsilon_small: 1e-6 # ještě menší epsilon pro některé operace

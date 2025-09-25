@@ -83,29 +83,55 @@ def estimate_contrast(gray: np.ndarray) -> float:
     return float(np.std(gray))
 
 
-def exposure_metrics(gray: np.ndarray) -> Tuple[float, float, float]:
+def exposure_metrics(
+    gray: np.ndarray, config: Optional[Dict] = None
+) -> Tuple[float, float, float]:
+    image_proc_config = (config or {}).get("image_processing", {})
+    exposure_config = image_proc_config.get("exposure", {})
+    constants_config = (config or {}).get("constants", {})
+
+    underexposure_bins = exposure_config.get("underexposure_bins", 10)
+    overexposure_start = exposure_config.get("overexposure_start", 246)
+    epsilon = constants_config.get("epsilon", 1e-9)
+
     mean = float(np.mean(gray))
     hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).ravel()
-    hist = hist / (hist.sum() + 1e-9)
-    under = float(hist[:10].sum())
-    over = float(hist[246:].sum())
+    hist = hist / (hist.sum() + epsilon)
+    under = float(hist[:underexposure_bins].sum())
+    over = float(hist[overexposure_start:].sum())
     return mean, under, over
 
 
 def exposure_score_from_metrics(
-    mean: float, under_frac: float, over_frac: float
+    mean: float, under_frac: float, over_frac: float, config: Optional[Dict] = None
 ) -> float:
-    center_penalty = abs(mean - 128.0) / 128.0
-    clip_penalty = 2.0 * (under_frac + over_frac)
-    raw = 1.0 - min(1.0, 0.6 * center_penalty + 0.4 * clip_penalty)
+    image_proc_config = (config or {}).get("image_processing", {})
+    exposure_config = image_proc_config.get("exposure", {})
+
+    center_value = exposure_config.get("center_value", 128.0)
+    center_penalty_weight = exposure_config.get("center_penalty_weight", 0.6)
+    clip_penalty_weight = exposure_config.get("clip_penalty_weight", 0.4)
+    clip_multiplier = exposure_config.get("clip_multiplier", 2.0)
+
+    center_penalty = abs(mean - center_value) / center_value
+    clip_penalty = clip_multiplier * (under_frac + over_frac)
+    raw = 1.0 - min(
+        1.0, center_penalty_weight * center_penalty + clip_penalty_weight * clip_penalty
+    )
     return float(max(0.0, min(1.0, raw)))
 
 
-def estimate_noise_score(gray: np.ndarray) -> float:
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+def estimate_noise_score(gray: np.ndarray, config: Optional[Dict] = None) -> float:
+    image_proc_config = (config or {}).get("image_processing", {})
+
+    gaussian_kernel_size = tuple(image_proc_config.get("gaussian_kernel_size", [3, 3]))
+    gaussian_sigma = image_proc_config.get("gaussian_sigma", 0)
+    noise_scaling_factor = image_proc_config.get("noise_scaling_factor", 25.0)
+
+    blur = cv2.GaussianBlur(gray, gaussian_kernel_size, gaussian_sigma)
     resid = gray.astype(np.float32) - blur.astype(np.float32)
     resid_std = float(np.std(resid))
-    score = 1.0 - min(1.0, resid_std / 25.0)
+    score = 1.0 - min(1.0, resid_std / noise_scaling_factor)
     return float(max(0.0, score))
 
 
@@ -163,31 +189,51 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 # -----------------------------------------------------------------------------
 # Agro proxies a binning
 # -----------------------------------------------------------------------------
-def altitude_proxy(gray: np.ndarray) -> float:
+def altitude_proxy(gray: np.ndarray, config: Optional[Dict] = None) -> float:
     # HF energie jako průměr absolutní hodnoty high-pass
-    hp = gray.astype(np.float32) - cv2.GaussianBlur(gray, (3, 3), 0)
+    image_proc_config = (config or {}).get("image_processing", {})
+
+    gaussian_kernel_size = tuple(image_proc_config.get("gaussian_kernel_size", [3, 3]))
+    gaussian_sigma = image_proc_config.get("gaussian_sigma", 0)
+
+    hp = gray.astype(np.float32) - cv2.GaussianBlur(
+        gray, gaussian_kernel_size, gaussian_sigma
+    )
     return float(np.mean(np.abs(hp)))
 
 
-def view_entropy(gray: np.ndarray, bins: Optional[int] = None) -> float:
+def view_entropy(
+    gray: np.ndarray, bins: Optional[int] = None, config: Optional[Dict] = None
+) -> float:
     if bins is None:
-        bins = 8
-    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        proxies_config = (config or {}).get("proxies", {})
+        bins = proxies_config.get("view_entropy_bins", 8)
+
+    image_proc_config = (config or {}).get("image_processing", {})
+    constants_config = (config or {}).get("constants", {})
+
+    sobel_kernel_size = image_proc_config.get("sobel_kernel_size", 3)
+    epsilon = constants_config.get("epsilon", 1e-9)
+
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=sobel_kernel_size)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=sobel_kernel_size)
     mag, ang = cv2.cartToPolar(gx, gy, angleInDegrees=False)
     hist, _ = np.histogram(
         ang.ravel(), bins=bins, range=(0, 2 * np.pi), weights=mag.ravel()
     )
-    p = hist / (hist.sum() + 1e-9)
-    ent = -np.sum(p * np.log(p + 1e-9))
+    p = hist / (hist.sum() + epsilon)
+    ent = -np.sum(p * np.log(p + epsilon))
     return float(ent)
 
 
-def green_cover_ratio(bgr: np.ndarray, threshold: Optional[float] = None) -> float:
+def green_cover_ratio(
+    bgr: np.ndarray, threshold: Optional[float] = None, config: Optional[Dict] = None
+) -> float:
     # Excess Green proxy (0..1)
     if threshold is None:
         threshold = 0.6
-    b, g, r = cv2.split(bgr.astype(np.float32) + 1e-6)
+    small_eps = (config or {}).get("constants", {}).get("epsilon_small", 1e-6)
+    b, g, r = cv2.split(bgr.astype(np.float32) + small_eps)
     exg = 2 * g - r - b
     exg_norm = (exg - exg.min()) / (exg.max() - exg.min() + 1e-9)
     return float(np.mean(exg_norm >= threshold))
@@ -229,12 +275,13 @@ def bin_lighting(mean_int: float, threshold: Optional[float] = None) -> str:
 # Streamování videa + prefilter + výpočet proxy
 # -----------------------------------------------------------------------------
 def iter_video_frames(
-    video_path: str, stride: int = 1
+    video_path: str, stride: int = 1, config: Optional[Dict] = None
 ) -> Iterable[Tuple[int, float, np.ndarray]]:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Nelze otevřít video: {video_path}")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    constants_config = (config or {}).get("constants", {})
+    fps = cap.get(cv2.CAP_PROP_FPS) or constants_config.get("fallback_fps", 30.0)
     idx = 0
     while True:
         ok, frame = cap.read()
@@ -264,7 +311,7 @@ def prefilter_candidates(
     log_intervals = output_config.get("log_intervals", {})
     frames_processed_interval = log_intervals.get("frames_processed", 1000)
 
-    for idx, t_sec, bgr in iter_video_frames(video_path, stride=stride):
+    for idx, t_sec, bgr in iter_video_frames(video_path, stride=stride, config=config):
         total_frames += 1
         if total_frames % frames_processed_interval == 0:
             logger.debug(f"Processed {total_frames} frames, kept {len(out)} candidates")
@@ -280,19 +327,19 @@ def prefilter_candidates(
             )
             continue
 
-        mean, under, over = exposure_metrics(gray)
-        expo = exposure_score_from_metrics(mean, under, over)
-        noise = estimate_noise_score(gray)
-        hsv, low, emb = combined_embed(bgr)
+        mean, under, over = exposure_metrics(gray, config=config)
+        expo = exposure_score_from_metrics(mean, under, over, config=config)
+        noise = estimate_noise_score(gray, config=config)
+        hsv, low, emb = combined_embed(bgr, config=config)
 
         # agro proxies (continuous)
         proxies_config = (config or {}).get("proxies", {})
         view_bins = proxies_config.get("view_entropy_bins", 8)
         green_threshold = proxies_config.get("green_cover_threshold", 0.6)
 
-        hf = altitude_proxy(gray)
-        ent = view_entropy(gray, bins=view_bins)
-        gcr = green_cover_ratio(bgr, threshold=green_threshold)
+        hf = altitude_proxy(gray, config=config)
+        ent = view_entropy(gray, bins=view_bins, config=config)
+        gcr = green_cover_ratio(bgr, threshold=green_threshold, config=config)
         light_mean = float(np.mean(gray))
 
         logger.debug(
@@ -570,15 +617,24 @@ class AgroStratifier:
 # Quality-aware deduplikace (greedy) + cosine threshold
 # -----------------------------------------------------------------------------
 def auto_eps_from_adjacent_sims(
-    frames: List[FrameInfo], quantile: float = 0.90
+    frames: List[FrameInfo],
+    quantile: Optional[float] = None,
+    config: Optional[Dict] = None,
 ) -> float:
     if len(frames) < 3:
         return 0.10
+    constants_config = (config or {}).get("constants", {})
+    q = (
+        quantile
+        if quantile is not None
+        else constants_config.get("dbscan_auto_eps_quantile", 0.90)
+    )
+    bounds = constants_config.get("dbscan_eps_bounds", [0.02, 0.30])
     sims = []
     for i in range(len(frames) - 1):
         sims.append(cosine_similarity(frames[i].embed, frames[i + 1].embed))
-    Q = float(np.quantile(np.array(sims, dtype=np.float32), quantile))
-    eps = max(0.02, min(0.30, 1.0 - Q))
+    Q = float(np.quantile(np.array(sims, dtype=np.float32), q))
+    eps = max(float(bounds[0]), min(float(bounds[1]), 1.0 - Q))
     return eps
 
 
@@ -631,7 +687,7 @@ def deduplicate_dbscan(
         try:
             eps = dedup_conf.get("eps", None)
             if eps is None:
-                eps = auto_eps_from_adjacent_sims(frames)
+                eps = auto_eps_from_adjacent_sims(frames, config=config)
         except Exception:
             eps = 0.1
 
@@ -745,9 +801,12 @@ def curate_video(
         # Stratified selection
         logger.info("Step 4/5: Applying stratified selection...")
         strat = AgroStratifier(config or {})
-        first_batch = strat.select(cand_sorted, max(1, target_size // 2), config=config)
+        selection_config = (config or {}).get("selection", {})
+        stratified_split_ratio = selection_config.get("stratified_split_ratio", 0.5)
+        first_size = max(1, int(round(target_size * stratified_split_ratio)))
+        first_batch = strat.select(cand_sorted, first_size, config=config)
         logger.debug(
-            f"Stratified selection: {len(first_batch)} frames selected from first batch"
+            f"Stratified selection: {len(first_batch)} frames selected from first batch (first_size={first_size})"
         )
 
         # 5) Doplnění top kvality
