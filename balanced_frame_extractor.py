@@ -366,14 +366,39 @@ def save_results(
         if (i + 1) % log_interval == 0:
             logger.debug(f"Uloženo {i + 1}/{len(frames)} snímků")
 
-    # Sestavení manifestu
+    # Sestavení manifestu + agregace distribuce strat pro celou kolekci
+    # Vytvoříme dvě agregace:
+    #  - strata_distribution: mapuje kombinovanou klíčovou string → počet
+    #  - axes_summary: pro každou osu (altitude, view, cover, lighting) map hodnot → počet
+    strata_distribution: Dict[str, int] = {}
+    axes_summary: Dict[str, Dict[str, int]] = {
+        "altitude": {},
+        "view": {},
+        "cover": {},
+        "lighting": {},
+    }
+
+    for f in frames:
+        if not f.strata:
+            continue
+        a, v, c, l = f.strata  # type: ignore
+        combo_key = f"altitude:{a}|view:{v}|cover:{c}|lighting:{l}"
+        strata_distribution[combo_key] = strata_distribution.get(combo_key, 0) + 1
+
+        axes_summary["altitude"][a] = axes_summary["altitude"].get(a, 0) + 1
+        axes_summary["view"][v] = axes_summary["view"].get(v, 0) + 1
+        axes_summary["cover"][c] = axes_summary["cover"].get(c, 0) + 1
+        axes_summary["lighting"][l] = axes_summary["lighting"].get(l, 0) + 1
+
     manifest = {
         "video": os.path.abspath(video_path),
-        "run_params": run_params,
+        "run_params": run_params or {},
         "count_candidates": num_candidates,
         "count_selected": len(frames),
         "out_dir": os.path.abspath(out_dir),
         "axes": ["altitude", "view", "cover", "lighting"],
+        "strata_distribution": strata_distribution,
+        "axes_summary": axes_summary,
         "frames": [
             {
                 "saved_path": os.path.abspath(p),
