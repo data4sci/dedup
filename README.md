@@ -57,7 +57,16 @@ Přesné CLI volby dostupné ve skriptu (`main()`):
 - `--novelty-threshold` — práh pro novost / prototypy (0..1)
 - `--dedup-method` — `greedy` nebo `dbscan`
 - `--manifest` — název manifest souboru
+- `--overwrite` — přepište existující výstupní adresář bez potvrzení (užitečné pro CI)
 - `--debug` — zapnout debug logy
+
+Poznámka o chování `--overwrite`:
+
+- Pokud je `--overwrite` předán, existující výstupní adresář bude rekurzivně smazán před spuštěním pipeline.
+- Pokud `--overwrite` není předán:
+  - V interaktivním prostředí (TTY) skript vyzve uživatele: "Output directory '...' exists. Overwrite? (yes/No)". Implicitní odpověď je No — bez potvrzení skript bezpečně ukončí.
+  - V neinteraktivním prostředí (CI, pipe apod.) skript ukončí s chybou a vyžaduje explicitní `--overwrite`, aby nedošlo k nechtěnému smazání dat.
+  - Toto chování zajišťuje bezpečné výchozí nastavení pro automatizované běhy.
 
 Ukázka s přepsáním parametrů přes CLI:
 

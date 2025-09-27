@@ -28,6 +28,8 @@ Důležité poznámky:
 from __future__ import annotations
 
 import os
+import sys
+import shutil
 import json
 import argparse
 import logging
@@ -958,6 +960,11 @@ def main():
     )
     parser.add_argument("--manifest", help="Name of output manifest file.")
     parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing output directory without prompting.",
+    )
+    parser.add_argument(
         "--debug", action="store_true", help="Enable debug logging to console."
     )
 
@@ -1014,6 +1021,53 @@ def main():
         video_base = os.path.splitext(os.path.basename(args.video))[0]
         args.out = os.path.join("data", "output", video_base)
         run_params["out"] = {"value": args.out, "source": "derived"}
+
+    # If output directory exists, handle overwrite logic BEFORE initializing logging
+    # (avoids creating log files inside an output dir we may immediately remove).
+    if os.path.exists(args.out):
+        # If explicit overwrite flag, remove without prompting
+        if args.overwrite:
+            try:
+                shutil.rmtree(args.out)
+            except Exception as e:
+                # Logging isn't configured yet; print a concise error and exit.
+                print(
+                    f"Error removing existing output directory '{args.out}': {e}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        else:
+            # If running interactively, ask user for confirmation (default: No)
+            if sys.stdin.isatty():
+                try:
+                    ans = input(
+                        f"Output directory '{args.out}' exists. Overwrite? (yes/No): "
+                    )
+                except EOFError:
+                    ans = ""
+                if ans.strip().lower() in ("y", "yes"):
+                    try:
+                        shutil.rmtree(args.out)
+                    except Exception as e:
+                        print(
+                            f"Error removing existing output directory '{args.out}': {e}",
+                            file=sys.stderr,
+                        )
+                        sys.exit(1)
+                else:
+                    # Respect user's choice to not overwrite
+                    print(
+                        "Output directory exists and overwrite not confirmed. Exiting.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(0)
+            else:
+                # Non-interactive environment: require explicit --overwrite
+                print(
+                    f"Output directory '{args.out}' exists and --overwrite not provided; cannot prompt in non-interactive mode.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
 
     # Setup logging
     setup_logging(args.out, args.debug)
