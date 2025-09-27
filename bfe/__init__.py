@@ -30,3 +30,11 @@ from .deduplication import (
     deduplicate_quality_first,
     deduplicate_dbscan,
 )
+from .video_io import iter_video_frames
+from .scoring import MLFrameScorer
+from .binning import (
+    bin_altitude,
+    bin_view,
+    bin_cover,
+    bin_lighting,
+)

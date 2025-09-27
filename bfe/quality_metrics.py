@@ -36,7 +36,7 @@ def exposure_metrics(
 
     underexposure_bins = exposure_config.get("underexposure_bins", 10)
     overexposure_start = exposure_config.get("overexposure_start", 246)
-    epsilon = constants_config.get("epsilon", 1e-9)
+    epsilon = float(constants_config.get("epsilon", 1e-9))
 
     mean = float(np.mean(gray))
     hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).ravel()

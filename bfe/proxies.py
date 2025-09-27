@@ -38,7 +38,7 @@ def view_entropy(
     constants_config = (config or {}).get("constants", {})
 
     sobel_kernel_size = image_proc_config.get("sobel_kernel_size", 3)
-    epsilon = constants_config.get("epsilon", 1e-9)
+    epsilon = float(constants_config.get("epsilon", 1e-9))
 
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=sobel_kernel_size)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=sobel_kernel_size)
@@ -59,7 +59,7 @@ def green_cover_ratio(
     """
     if threshold is None:
         threshold = 0.6
-    small_eps = (config or {}).get("constants", {}).get("epsilon_small", 1e-6)
+    small_eps = float((config or {}).get("constants", {}).get("epsilon_small", 1e-6))
     b, g, r = cv2.split(bgr.astype(np.float32) + small_eps)
     exg = 2 * g - r - b
     exg_norm = (exg - exg.min()) / (exg.max() - exg.min() + 1e-9)
