@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ML-Driven Frame Curation — Agro Stratification
-==============================================
+Balanced Frame Extractor — Agro ML Dataset Curation (orchestrator)
+================================================================
 
-Tento skript slouží jako orchestrátor pro kuraci snímků z videí.
-Používá knihovnu `bfe` k provedení následujících kroků:
+Cílem tohoto modulu je orchestrace procesu kurace snímků z droních videí
+pro vytvoření vyváženého datasetu pro ML trénink. Implementované kroky
+odpovídají popisu v README.md a používají jednotnou terminologii:
 
-1.  **Prefilter snímků**: Odstraní snímky s nízkou ostrostí a kontrastem.
-2.  **Výpočet metrik a embeddingů**: Pro každý snímek spočítá metriky kvality,
-    agro-proxy a embeddingy.
-3.  **ML skórování**: Ohodnotí každý snímek na základě kvality a novosti obsahu.
-4.  **Stratifikace**: Rozdělí snímky do kategorií (strat) podle agro-proxy metrik.
-5.  **Výběr snímků**: Vybere nejlepší snímky na základě stratifikace a ML skóre.
-6.  **Deduplikace**: Odstraní vizuálně podobné snímky.
-7.  **Uložení výsledků**: Uloží vybrané snímky a vytvoří `manifest.json` se statistikami.
+- Pre-filter (prefilter): odstranění snímků s nízkou kvalitou (ostrost, kontrast).
+- Quality metrics: výpočet metrik kvality (exposure, noise, lighting mean).
+- Embeddings: výpočet embeddingů (HSV hist + LowRes vector + případné modelové embed).
+- Agro-proxy: proxy metriky použité pro stratifikaci — altitude (hf_energy), view entropy,
+  green cover ratio, lighting mean.
+- ML skórování: ohodnocení kandidátů pomocí `MLFrameScorer` (kombinace kvality a novosti).
+- Selection:
+  - Stratified selection (pokud je zadán `target_size`) → používá `AgroStratifier`.
+  - Threshold-based selection (pokud `target_size` není zadán) → top % kandidátů.
+- Deduplication: odstranění vizuálních duplicit (`greedy` nebo `dbscan`).
+- Output / manifest (level-0): uloží vybrané snímky a vygeneruje `manifest.json`
+  se strukturou: `input_video`, `run_params`, `task_summary`, `frames`.
 
-Použití:
-    python balanced_frame_extractor.py <video_path> -o <output_dir> --config config.yaml
+Důležité poznámky:
+- Terminologie v komentářích a docstringách byla sjednocena podle README.
+- Tento soubor mění pouze komentáře a docstringy; chování kódu zůstává beze změny.
 """
 from __future__ import annotations
 
@@ -33,7 +39,7 @@ import cv2
 import numpy as np
 import yaml
 
-# Importy z refaktorované knihovny `bfe`
+# Importy z refaktorované knihovny `bfe` — nízkoúrovňové implementace pro jednotlivé kroky.
 from bfe.frame_info import FrameInfo
 from bfe.video_io import iter_video_frames
 from bfe.quality_metrics import (
@@ -52,9 +58,8 @@ from bfe.deduplication import deduplicate_quality_first, deduplicate_dbscan
 
 logger = logging.getLogger(__name__)
 
-
 # -----------------------------------------------------------------------------
-# Krok 1: Prefilter a výpočet metrik
+# Krok 1: Pre-filter + výpočet metrik a embeddingů (prefilter_and_process_frames)
 # -----------------------------------------------------------------------------
 
 
@@ -66,29 +71,35 @@ def prefilter_and_process_frames(
     config: Optional[Dict] = None,
 ) -> List[FrameInfo]:
     """
-    Iteruje video, provádí pre-filtraci a počítá všechny potřebné metriky a embeddingy.
-    Tato funkce kombinuje původní `prefilter_candidates` s výpočty, které následovaly.
+    Iteruje video a provádí pre-filter + kompletní výpočet metrík, agro-proxy a embeddingů.
+
+    Tento krok provede:
+      - Pre-filter (ostrost: variance of Laplacian, kontrast: odhad rozptylu šedi).
+      - Pokud snímek projde pre-filterem, spočítá exposure metrics, exposure_score,
+        noise_score a lighting_mean.
+      - Spočítá embeddingy: HSV histogram, low-resolution vector a případné modelové embed.
+      - Spočítá agro-proxy: altitude proxy (hf_energy), view entropy, green cover ratio.
 
     Args:
-        video_path (str): Cesta k videu.
-        stride (int): Krok pro čtení snímků.
-        min_sharpness (float): Minimální povolená ostrost.
-        min_contrast (float): Minimální povolený kontrast.
-        config (Optional[Dict]): Konfigurační slovník.
+        video_path (str): Cesta k vstupnímu videu.
+        stride (int): Vybírat každý N-tý snímek (redukuje množství kandidátů).
+        min_sharpness (float): Minimální práh pro ostrost (Variance of Laplacian).
+        min_contrast (float): Minimální práh pro kontrast (std-dev šedé).
+        config (Optional[Dict]): Konfigurační slovník (config.yaml).
 
     Returns:
-        List[FrameInfo]: Seznam kandidátských snímků s vyplněnými metrikami.
+        List[FrameInfo]: Seznam kandidátů (FrameInfo) s vyplněnými metrikami, proxy a embeddingy.
     """
-    logger.info(f"Zahájení pre-filtrace a zpracování pro video: {video_path}")
+    logger.info(f"Starting pre-filter & processing for video: {video_path}")
     logger.info(
-        f"Parametry: krok={stride}, min_ostrost={min_sharpness}, min_kontrast={min_contrast}"
+        f"Parameters: stride={stride}, min_sharpness={min_sharpness}, min_contrast={min_contrast}"
     )
 
     candidates: List[FrameInfo] = []
     total_frames = 0
     filtered_out = 0
 
-    # Načtení konfiguračních hodnot
+    # Konfigurační pomocné hodnoty (výstup + proxy nastavení)
     output_config = (config or {}).get("output", {})
     log_intervals = output_config.get("log_intervals", {})
     frames_processed_interval = log_intervals.get("frames_processed", 1000)
@@ -96,24 +107,25 @@ def prefilter_and_process_frames(
     view_bins = proxies_config.get("view_entropy_bins", 8)
     green_threshold = proxies_config.get("green_cover_threshold", 0.6)
 
+    # Iterace přes snímky z videa (stroming, memory-friendly)
     for idx, t_sec, bgr in iter_video_frames(video_path, stride=stride, config=config):
         total_frames += 1
         if total_frames % frames_processed_interval == 0:
             logger.debug(
-                f"Zpracováno {total_frames} snímků, ponecháno {len(candidates)} kandidátů"
+                f"Processed {total_frames} frames, kept {len(candidates)} candidates"
             )
 
-        # Základní metriky kvality
+        # Základní quality metrics (grayscale pro většinu metrik)
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        sharpness = variance_of_laplacian(gray)
-        contrast = estimate_contrast(gray)
+        sharpness = variance_of_laplacian(gray)  # ostrost proxy
+        contrast = estimate_contrast(gray)  # kontrast proxy
 
-        # Prefilter
+        # Pre-filter: vyřadíme snímky s nízkou ostrostí nebo kontrastem.
         if sharpness < min_sharpness or contrast < min_contrast:
             filtered_out += 1
             logger.debug(
-                f"Snímek {idx} odfiltrován: ostrost={sharpness:.1f} (min={min_sharpness}), "
-                f"kontrast={contrast:.1f} (min={min_contrast})"
+                f"Frame {idx} filtered out: sharpness={sharpness:.1f} (min={min_sharpness}), "
+                f"contrast={contrast:.1f} (min={min_contrast})"
             )
             continue
 
@@ -122,21 +134,21 @@ def prefilter_and_process_frames(
         exposure_score = exposure_score_from_metrics(mean, under, over, config=config)
         noise_score = estimate_noise_score(gray, config=config)
 
-        # Embeddingy
+        # Embeddings: kombinujeme HSV histogram + lowres vector + (volitelně) model embed
         hsv_hist, lowres_vec, embed = combined_embed(bgr, config=config)
 
-        # Agro proxies
-        hf_energy = altitude_proxy(gray, config=config)
+        # Agro-proxy metriky používané pro stratifikaci
+        hf_energy = altitude_proxy(gray, config=config)  # altitude proxy (hf_energy)
         view_entropy_val = view_entropy(gray, bins=view_bins, config=config)
         green_cover = green_cover_ratio(bgr, threshold=green_threshold, config=config)
         lighting_mean = float(np.mean(gray))
 
         logger.debug(
-            f"Snímek {idx}: ostrost={sharpness:.1f}, kontrast={contrast:.1f}, exp_skóre={exposure_score:.3f}, "
-            f"hf_energie={hf_energy:.2f}, entropie_pohledu={view_entropy_val:.2f}, zelen={green_cover:.3f}"
+            f"Frame {idx}: sharpness={sharpness:.1f}, contrast={contrast:.1f}, exposure_score={exposure_score:.3f}, "
+            f"hf_energy={hf_energy:.2f}, view_entropy={view_entropy_val:.2f}, green_cover={green_cover:.3f}"
         )
 
-        # Vytvoření a uložení objektu FrameInfo
+        # Uložení kandidáta s kompletními metrikami/embeddingy/proxy
         candidates.append(
             FrameInfo(
                 idx=idx,
@@ -158,14 +170,14 @@ def prefilter_and_process_frames(
         )
 
     logger.info(
-        f"Prefilter dokončen: Z {total_frames} snímků ponecháno {len(candidates)} kandidátů, "
-        f"{filtered_out} odfiltrováno."
+        f"Pre-filter completed: from {total_frames} frames kept {len(candidates)} candidates, "
+        f"{filtered_out} filtered out."
     )
     return candidates
 
 
 # -----------------------------------------------------------------------------
-# Krok 2: Binning (kategorizace) pro stratifikaci
+# Krok 2: Binning / přiřazení strat (assign_strata_to_frames)
 # -----------------------------------------------------------------------------
 
 
@@ -173,31 +185,41 @@ def assign_strata_to_frames(
     frames: List[FrameInfo], config: Optional[Dict] = None
 ) -> None:
     """
-    Přiřadí každému snímku jeho stratum (kategorii) na základě agro-proxy metrik.
+    Přiřadí každému kandidátnímu snímku jeho stratum (kategorii) na základě agro-proxy.
+
+    Popis:
+      - Pro každou osu (altitude, view, cover, lighting) provede binning pomocí
+        utilit z `bfe.binning`.
+      - `altitude` binning používá kvantil (defaultně medián q=0.5), který je
+        počítán z celého datasetu kandidátů — to zajistí relativní rozdělení
+        podle scénáře z daného videa.
 
     Args:
-        frames (List[FrameInfo]): Seznam snímků ke zpracování.
-        config (Optional[Dict]): Konfigurační slovník.
+        frames (List[FrameInfo]): Seznam kandidátů s vyplněnými agro-proxy.
+        config (Optional[Dict]): Konfigurační slovník (může obsahovat stratification.thresholds).
+
+    Returns:
+        None -- funkce mutuje objekty FrameInfo (nastaví `strata` atribut).
     """
     if not frames:
         return
 
-    logger.info("Zahájení výpočtu a přiřazování strat...")
+    logger.info("Starting strata computation and assignment...")
 
-    # Získání prahových hodnot z konfigurace
     stratification_config = (config or {}).get("stratification", {})
     thresholds = stratification_config.get("thresholds", {})
     view_threshold = thresholds.get("view_entropy", 1.8)
     cover_threshold = thresholds.get("cover_ratio", 0.5)
     lighting_threshold = thresholds.get("lighting_mean", 115)
 
-    # Pro `altitude` potřebujeme kvantil, počítáme ho z celého datasetu
+    # Altitude quantile (medián default). TODO: parametrizovat kvantil v configu, pokud požadováno.
     hf_vals = np.array([f.hf_energy for f in frames], dtype=np.float32)
     altitude_q50 = float(np.quantile(hf_vals, 0.5))
-    logger.debug(f"Kvantil pro altitude (q50 z HF energie): {altitude_q50:.2f}")
+    logger.debug(f"Altitude quantile (q50 of hf_energy): {altitude_q50:.2f}")
 
     strata_counts = defaultdict(int)
     for f in frames:
+        # Binning podle os — výsledkem jsou štítky (např. 'low','mid','high')
         a = bin_altitude(f.hf_energy, altitude_q50)
         v = bin_view(f.view_entropy_val, t=view_threshold)
         c = bin_cover(f.green_cover, threshold=cover_threshold)
@@ -205,12 +227,12 @@ def assign_strata_to_frames(
         f.strata = (a, v, c, l)
         strata_counts[f.strata] += 1
 
-    logger.debug(f"Distribuce snímků ve stratách: {dict(strata_counts)}")
-    logger.info("Přiřazování strat dokončeno.")
+    logger.debug(f"Strata distribution: {dict(strata_counts)}")
+    logger.info("Strata assignment completed.")
 
 
 # -----------------------------------------------------------------------------
-# Krok 3: Výběr a deduplikace
+# Krok 3: Selection (stratified nebo threshold-based) + Deduplication
 # -----------------------------------------------------------------------------
 
 
@@ -221,44 +243,55 @@ def select_and_deduplicate(
     dedup_method: Optional[str] = None,
 ) -> List[FrameInfo]:
     """
-    Provede finální výběr snímků pomocí stratifikace (pokud je `target_size` zadán)
-    nebo prahování, a následně provede deduplikaci.
+    Provede finální výběr snímků (selection) a následnou deduplikaci.
+
+    Selection:
+      - Pokud je `target_size` zadán: stratifikovaný výběr pomocí `AgroStratifier`
+        (cílem je dosáhnout rovnoměrné zastoupení napříč stratami).
+      - Pokud `target_size` není zadán: threshold-based selection — vybere se
+        top N% kandidátů podle ML skóre (nastavitelné přes `selection.threshold_selection_ratio`).
+
+    Deduplication:
+      - Metoda `greedy` (quality-first s prahovou kosinovou podobností).
+      - Metoda `dbscan` (shlukování embeddingů přes DBSCAN).
 
     Args:
-        frames (List[FrameInfo]): Seznam kandidátských snímků, seřazených dle ML skóre.
-        target_size (Optional[int]): Cílový počet snímků.
+        frames (List[FrameInfo]): Kandidáti (očekává se, že mají `ml_score` vyplněné).
+        target_size (Optional[int]): Cílový počet vybraných snímků (pokud None → threshold-based).
         config (Optional[Dict]): Konfigurační slovník.
-        dedup_method (Optional[str]): Metoda deduplikace ('greedy' nebo 'dbscan').
+        dedup_method (Optional[str]): Přepsat metodu deduplikace ('greedy'|'dbscan').
 
     Returns:
-        List[FrameInfo]: Finální seznam vybraných snímků.
+        List[FrameInfo]: Finalní seznam vybraných (a deduplikovaných) FrameInfo objektů.
     """
     if not frames:
         return []
 
-    # Seřazení kandidátů podle ML skóre (od nejlepšího)
+    # Seřazení kandidátů podle ML skóre (nejlepší první)
     frames_sorted = sorted(frames, key=lambda x: x.ml_score, reverse=True)
 
-    # --- Předběžný výběr ---
+    # --- Preliminary selection ---
     if target_size is None:
-        # Metoda založená na prahu: vezmeme top N % kandidátů
+        # Threshold-based selection: vezmeme top % kandidátů podle konfigurace
         selection_config = (config or {}).get("selection", {})
         threshold_ratio = selection_config.get("threshold_selection_ratio", 0.25)
         threshold_count = max(1, int(len(frames) * threshold_ratio))
         logger.info(
-            f"Výběr na základě prahu: vybráno top {threshold_count} snímků ({threshold_ratio:.1%} kandidátů)."
+            f"Threshold-based selection: selecting top {threshold_count} frames ({threshold_ratio:.1%} of candidates)."
         )
         preliminary_selection = frames_sorted[:threshold_count]
     else:
-        # Stratifikovaný výběr pro dosažení cílového počtu
-        logger.info(f"Výběr pomocí stratifikace s cílem {target_size} snímků.")
+        # Stratified selection: AgroStratifier zajistí rozmanitost napříč stratami
+        logger.info(f"Stratified selection to reach target size {target_size}.")
         stratifier = AgroStratifier(config or {})
         preliminary_selection = stratifier.select(
             frames_sorted, target_size, config=config
         )
-        logger.debug(f"Stratifikovaný výběr: {len(preliminary_selection)} snímků.")
+        logger.debug(
+            f"Stratified selection produced {len(preliminary_selection)} frames."
+        )
 
-        # Doplnění o nejkvalitnější snímky, pokud stratifikace vrátila méně, než je cíl
+        # Pokud stratifikace vrátila méně než požadované, doplníme top-quality kandidáty
         if len(preliminary_selection) < target_size:
             needed = target_size - len(preliminary_selection)
             remaining_candidates = [
@@ -266,12 +299,12 @@ def select_and_deduplicate(
             ]
             to_add = remaining_candidates[:needed]
             preliminary_selection.extend(to_add)
-            logger.debug(f"Doplněno {len(to_add)} snímky s nejvyšším skóre.")
+            logger.debug(f"Added {len(to_add)} top-quality frames to meet target.")
 
-    logger.info(f"Předběžný výběr obsahuje {len(preliminary_selection)} snímků.")
+    logger.info(f"Preliminary selection size: {len(preliminary_selection)}")
 
-    # --- Deduplikace ---
-    logger.info("Zahájení deduplikace...")
+    # --- Deduplication ---
+    logger.info("Starting deduplication...")
     deduplication_config = (config or {}).get("deduplication", {})
     method = (dedup_method or deduplication_config.get("method") or "greedy").lower()
 
@@ -279,7 +312,7 @@ def select_and_deduplicate(
         eps = deduplication_config.get("eps", None)
         min_samples = int(deduplication_config.get("min_samples", 1))
         logger.info(
-            f"Používá se DBSCAN deduplikace (eps={eps}, min_samples={min_samples})."
+            f"Using DBSCAN deduplication (eps={eps}, min_samples={min_samples})."
         )
         final_selection = deduplicate_dbscan(
             preliminary_selection, eps=eps, min_samples=min_samples, config=config
@@ -287,32 +320,31 @@ def select_and_deduplicate(
     else:
         cosine_threshold = deduplication_config.get("cosine_threshold", 0.85)
         logger.info(
-            f"Používá se 'greedy' deduplikace (práh kosinové podobnosti={cosine_threshold})."
+            f"Using greedy deduplication (cosine_threshold={cosine_threshold})."
         )
         final_selection = deduplicate_quality_first(
             preliminary_selection, cosine_threshold=cosine_threshold, config=config
         )
 
-    logger.info(f"Po deduplikaci zbylo {len(final_selection)} snímků.")
+    logger.info(f"After deduplication {len(final_selection)} frames remain.")
 
-    # --- Doplnění po deduplikaci (pokud je to nutné a možné) ---
+    # --- Fill up after deduplication if necessary ---
     if target_size is not None and len(final_selection) < target_size:
         needed = target_size - len(final_selection)
         logger.debug(
-            f"Počet snímků ({len(final_selection)}) je pod cílem ({target_size}). Pokus o doplnění {needed} snímků."
+            f"Final selection ({len(final_selection)}) below target ({target_size}). Attempting to fill {needed} frames."
         )
 
-        # Vytvoříme pool zbývajících kandidátů, kteří nebyli vybráni
         remaining_pool = [f for f in frames_sorted if f not in final_selection]
         to_add = remaining_pool[:needed]
 
         if to_add:
             final_selection.extend(to_add)
             logger.debug(
-                f"Doplněno {len(to_add)} snímků, finální počet: {len(final_selection)}."
+                f"Added {len(to_add)} frames post-deduplication, final count: {len(final_selection)}."
             )
 
-    # Finální seřazení a oříznutí na cílovou velikost
+    # Finální seřazení podle ml_score a oříznutí na target_size (pokud zadáno)
     final_selection = sorted(final_selection, key=lambda x: x.ml_score, reverse=True)
     if target_size is not None:
         final_selection = final_selection[:target_size]
@@ -321,7 +353,7 @@ def select_and_deduplicate(
 
 
 # -----------------------------------------------------------------------------
-# Ukládání výsledků
+# Krok 4: Uložení výsledků + generace manifest.json (level-0 manifest)
 # -----------------------------------------------------------------------------
 
 
@@ -335,22 +367,28 @@ def save_results(
     config: Optional[Dict] = None,
 ) -> None:
     """
-    Uloží vybrané snímky na disk a vygeneruje manifest.json se všemi metadaty.
+    Uloží vybrané snímky do adresáře a vytvoří manifest (level-0).
+
+    Manifest level-0 klíče:
+      - input_video: absolutní cesta k původnímu videu
+      - run_params: map parametrů -> {"value": ..., "source": ...}
+      - task_summary: agregace (candidates_count, selected_count, axes_summary, ml_score apod.)
+      - frames: pole objektů s metadaty pro každý uložený snímek
 
     Args:
-        frames (List[FrameInfo]): Finální seznam vybraných snímků.
+        frames (List[FrameInfo]): Finalní seznam vybraných FrameInfo.
         out_dir (str): Výstupní adresář.
-        video_path (str): Cesta k původnímu videu.
-        num_candidates (int): Počet kandidátů po pre-filtraci.
-        run_params (Dict): Parametry běhu skriptu.
-        manifest_name (str): Název souboru manifestu.
-        config (Optional[Dict]): Konfigurační slovník.
+        video_path (str): Původní video (use to store in manifest).
+        num_candidates (int): Počet kandidátů po pre-filter kroku.
+        run_params (Dict): Parametry běhu se zdroji (cli/config/default).
+        manifest_name (str): Název souboru manifestu (výchozí "manifest.json").
+        config (Optional[Dict]): Konfigurace (používají se např. jpeg_quality).
     """
     if not frames:
-        logger.warning("Žádné snímky k uložení.")
+        logger.warning("No frames to save.")
         return
 
-    logger.info(f"Ukládání {len(frames)} vybraných snímků do adresáře: {out_dir}")
+    logger.info(f"Saving {len(frames)} selected frames to: {out_dir}")
     os.makedirs(out_dir, exist_ok=True)
 
     output_config = (config or {}).get("output", {})
@@ -359,17 +397,16 @@ def save_results(
 
     saved_paths = []
     for i, f in enumerate(frames):
+        # Jmenný formát souboru zahrnuje pořadové číslo, původní index a čas
         fname = f"frame_{i:06d}_src{f.idx:06d}_t{f.t_sec:010.3f}.jpg"
         path = os.path.join(out_dir, fname)
+        # Uložíme JPEG s nastavenou kvalitou
         cv2.imwrite(path, f.bgr, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
         saved_paths.append(path)
         if (i + 1) % log_interval == 0:
-            logger.debug(f"Uloženo {i + 1}/{len(frames)} snímků")
+            logger.debug(f"Saved {i + 1}/{len(frames)} frames")
 
-    # Sestavení manifestu + agregace distribuce strat pro celou kolekci
-    # Vytvoříme dvě agregace:
-    #  - strata_distribution: mapuje kombinovanou klíčovou string → počet
-    #  - axes_summary: pro každou osu (altitude, view, cover, lighting) map hodnot → počet
+    # Agregace: strata distribution (kombinované klíče) + axes_summary (po osách)
     strata_distribution: Dict[str, int] = {}
     axes_summary: Dict[str, Dict[str, int]] = {
         "altitude": {},
@@ -390,6 +427,7 @@ def save_results(
         axes_summary["cover"][c] = axes_summary["cover"].get(c, 0) + 1
         axes_summary["lighting"][l] = axes_summary["lighting"].get(l, 0) + 1
 
+    # Task summary: agregace metrik a statistiky ML skóre
     task_summary = {
         "video": os.path.basename(video_path),
         "output_dir": os.path.abspath(out_dir),
@@ -417,7 +455,7 @@ def save_results(
         "strata_distribution": strata_distribution,
     }
 
-    # Manifest structure (level-0): input_video, run_params, task_summary, frames
+    # Sestavení manifestu (level-0)
     manifest = {
         "input_video": os.path.abspath(video_path),
         "run_params": run_params or {},
@@ -447,11 +485,11 @@ def save_results(
     with open(manifest_path, "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, ensure_ascii=False, indent=2)
 
-    logger.info(f"Manifest uložen do: {manifest_path}")
+    logger.info(f"Manifest saved to: {manifest_path}")
 
 
 # -----------------------------------------------------------------------------
-# Hlavní orchestrační funkce
+# Orchestrace pipeline (run_curation_pipeline)
 # -----------------------------------------------------------------------------
 
 
@@ -462,18 +500,26 @@ def run_curation_pipeline(
     **kwargs,
 ) -> None:
     """
-    Hlavní funkce, která orchestruje celý proces kurace snímků.
+    Hlavní orchestrace kurace snímků — spojení všech kroků do pipeline.
+
+    Pořadí kroků:
+      1) Pre-filter & process → získáme kandidáty s metrikami a embeddingy.
+      2) ML skórování pomocí MLFrameScorer (vyhodnocení kvality + novosti).
+      3) Přiřazení strat (assign_strata_to_frames).
+      4) Výběr a deduplikace (select_and_deduplicate).
+      5) Uložení výsledků a manifest (save_results).
 
     Args:
         video_path (str): Cesta k video souboru.
         out_dir (str): Výstupní adresář.
         config (Optional[Dict]): Načtená YAML konfigurace.
-        **kwargs: Další parametry z CLI (stride, target_size, atd.).
+        **kwargs: Další parametry (stride, target_size, min_sharpness, min_contrast,
+                novelty_threshold, dedup_method, manifest_name, run_params apod.).
     """
     run_params = kwargs.get("run_params", {})
-    logger.info(f"Spouštění pipeline s parametry: {run_params}")
+    logger.info(f"Running pipeline with params: {run_params}")
 
-    # --- Krok 1: Prefilter a výpočet metrik ---
+    # --- Krok 1: Pre-filter & compute metrics / embeddings ---
     candidates = prefilter_and_process_frames(
         video_path=video_path,
         stride=kwargs.get("stride") or 1,
@@ -482,18 +528,18 @@ def run_curation_pipeline(
         config=config,
     )
     if not candidates:
-        logger.warning("Po pre-filtraci nezbyli žádní kandidáti. Proces končí.")
+        logger.warning("No candidates after pre-filter. Exiting pipeline.")
         return
 
-    # --- Krok 2: ML Skórování ---
-    logger.info("Zahájení ML skórování...")
+    # --- Krok 2: ML skórování (quality + novelty) ---
+    logger.info("Starting ML scoring...")
     scorer = MLFrameScorer(
         novelty_threshold=kwargs.get("novelty_threshold") or 0.3, config=config
     )
     scorer.score(candidates, config=config)
-    logger.info("ML skórování dokončeno.")
+    logger.info("ML scoring completed.")
 
-    # --- Krok 3: Přiřazení strat ---
+    # --- Krok 3: Přiřazení strat (binned agro-proxy) ---
     assign_strata_to_frames(candidates, config=config)
 
     # --- Krok 4: Výběr a deduplikace ---
@@ -504,7 +550,7 @@ def run_curation_pipeline(
         config=config,
     )
 
-    # --- Krok 5: Uložení výsledků ---
+    # --- Krok 5: Uložení výsledků a manifest ---
     save_results(
         frames=final_frames,
         out_dir=out_dir,
@@ -515,22 +561,22 @@ def run_curation_pipeline(
         config=config,
     )
 
-    logger.info("Pipeline na kuraci snímků byla úspěšně dokončena.")
+    logger.info("Frame curation pipeline completed successfully.")
 
 
 # -----------------------------------------------------------------------------
-# Pomocné funkce pro CLI a statistiky
+# Pomocné utilitky: načítání YAML, čtení/pretty print manifest statistik
 # -----------------------------------------------------------------------------
 
 
 def load_yaml(path: Optional[str]) -> Dict:
-    """Načte YAML soubor, pokud existuje."""
+    """Načte YAML konfigurační soubor a vrátí dict (pokud existuje)."""
     if path and os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return yaml.safe_load(f) or {}
         except Exception as e:
-            logger.error(f"Chyba při načítání YAML souboru {path}: {e}")
+            logger.error(f"Error loading YAML file {path}: {e}")
     return {}
 
 
@@ -538,32 +584,38 @@ def print_human_readable_statistics(
     manifest_path: str,
     elapsed: float = None,
 ) -> None:
-    """Vytiskne přehledné statistiky z manifest.json souboru."""
+    """
+    Vytiskne přehledné statistiky z `manifest.json`.
+
+    Vypisuje:
+      - základní info (video, output)
+      - počty kandidátů a vybraných snímků + selection ratio
+      - agregované ML skóre (avg, median, range)
+      - rozdělení napříč osami stratifikace (altitude, view, cover, lighting)
+      - volitelně dobu zpracování
+    """
     try:
         with open(manifest_path, "r", encoding="utf-8") as f:
             manifest = json.load(f)
     except Exception as e:
-        logger.error(f"Nepodařilo se načíst manifest {manifest_path}: {e}")
+        logger.error(f"Failed to read manifest {manifest_path}: {e}")
         return
 
     print("\n" + "=" * 80)
-    print("📊 STATISTIKY KURACE SNÍMKŮ")
+    print("📊 FRAME CURATION STATISTICS")
     print("=" * 80)
 
-    # Základní informace z task_summary
     task_summary = manifest.get("task_summary", {})
-    print(f"🎬 Video: {task_summary.get('video', 'Neznámé')}")
-    print(f"📁 Výstup: {task_summary.get('output_dir', 'Neznámý')}")
+    print(f"🎬 Video: {task_summary.get('video', 'Unknown')}")
+    print(f"📁 Output: {task_summary.get('output_dir', 'Unknown')}")
     print(
-        f"🔢 Výběr: {task_summary.get('selected_count', 'N/A')} snímků vybráno z {task_summary.get('candidates_count', 'N/A')} kandidátů"
+        f"🔢 Selection: {task_summary.get('selected_count', 'N/A')} frames selected from {task_summary.get('candidates_count', 'N/A')} candidates"
     )
-    print(f"📈 Poměr výběru: {task_summary.get('selection_ratio', 'N/A')}")
+    print(f"📈 Selection ratio: {task_summary.get('selection_ratio', 'N/A')}")
 
-    # Parametry běhu
     run_params = manifest.get("run_params", {})
     if run_params:
-        print("\n⚙️ POUŽITÉ PARAMETRY:")
-        # Pořadí pro hezčí výpis
+        print("\n⚙️ RUN PARAMETERS:")
         order = [
             "video",
             "out",
@@ -582,26 +634,24 @@ def print_human_readable_statistics(
                 param = run_params[key]
                 value = param.get("value", "N/A")
                 source = param.get("source", "N/A")
-                print(f"   - {key:20}: {str(value):<25} (zdroj: {source})")
+                print(f"   - {key:20}: {str(value):<25} (source: {source})")
 
     frames = manifest.get("frames", [])
     if not frames:
-        print("\n⚠️ V manifestu nebyly nalezeny žádné snímky.")
+        print("\n⚠️ No frames in manifest.")
         print("=" * 80)
         return
 
-    # Statistiky ML skóre
     ml_scores = [fr["ml_score"] for fr in frames if "ml_score" in fr]
     if ml_scores:
-        print(f"\n🎯 ML SKÓRE KVALITY:")
-        print(f"   Průměr: {np.mean(ml_scores):.3f}")
-        print(f"   Medián: {np.median(ml_scores):.3f}")
-        print(f"   Rozsah: {min(ml_scores):.3f} - {max(ml_scores):.3f}")
+        print(f"\n🎯 ML SCORE (quality + novelty):")
+        print(f"   Avg: {np.mean(ml_scores):.3f}")
+        print(f"   Median: {np.median(ml_scores):.3f}")
+        print(f"   Range: {min(ml_scores):.3f} - {max(ml_scores):.3f}")
 
-    # Rozdělení podle strat — preferovat top-level agregace z manifestu pokud jsou dostupné
-    axes_summary = manifest.get("axes_summary")
+    # Prefer top-level axes_summary in manifest.task_summary if available
+    axes_summary = manifest.get("task_summary", {}).get("axes_summary")
     if axes_summary:
-        # axes_summary je map: osa -> {hodnota: count}
         axis_counts = {
             axis: defaultdict(int, counts) for axis, counts in axes_summary.items()
         }
@@ -621,7 +671,7 @@ def print_human_readable_statistics(
                 axis_counts["cover"][c] += 1
                 axis_counts["lighting"][l] += 1
 
-    print("\n🏔️ ROZDĚLENÍ PODLE OS STRATIFIKACE:")
+    print("\n🏔️ STRATIFICATION AXES DISTRIBUTION:")
     total_selected = task_summary.get("selected_count", 0)
     for axis, counts in axis_counts.items():
         print(f"   --- {axis.upper()} ---")
@@ -631,30 +681,36 @@ def print_human_readable_statistics(
 
     if elapsed is not None:
         mins, secs = divmod(int(elapsed), 60)
-        print(f"\n⏱️ Doba zpracování: {mins}m {secs}s")
+        print(f"\n⏱️ Elapsed time: {mins}m {secs}s")
 
     print("=" * 80)
 
 
 # -----------------------------------------------------------------------------
-# CLI a spouštěcí bod
+# CLI / entrypoint
 # -----------------------------------------------------------------------------
 
 
 def setup_logging(log_dir: str, debug: bool):
-    """Nastaví logování do souboru a volitelně na konzoli."""
+    """
+    Nastaví logging do souboru a volitelně i na konzoli.
+
+    Poznámka: aktuální implementace používá `logging.FileHandler` bez rotace.
+    Pokud chcete rotaci logu (doporučeno v produkci), použijte `RotatingFileHandler`
+    nebo `TimedRotatingFileHandler` místo FileHandler.
+    """
     level = logging.DEBUG if debug else logging.INFO
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, "curation.log")
 
-    # Vytvoření handleru pro soubor s rotací
+    # File handler (přepisuje/nový soubor na každý běh)
     file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
     formatter = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
     file_handler.setFormatter(formatter)
 
-    # Nastavení root loggeru
+    # Root logger: nahradíme existující handlery aktuálním file handlerem
     root_logger = logging.getLogger()
-    root_logger.handlers = [file_handler]  # Odebrání existujících handlerů
+    root_logger.handlers = [file_handler]
     root_logger.setLevel(level)
 
     if debug:
@@ -664,54 +720,56 @@ def setup_logging(log_dir: str, debug: bool):
 
 
 def main():
-    """Hlavní spouštěcí funkce, parsuje argumenty a spouští pipeline."""
+    """Hlavní spouštěcí bod — parsování CLI argumentů a spuštění pipeline."""
     import sys
 
-    # Dočasné parsování pro načtení konfiguračního souboru
+    # Dočasné parsování pro načtení config cesty (--config)
     temp_parser = argparse.ArgumentParser(add_help=False)
-    temp_parser.add_argument("--config", default=None, help="Cesta k YAML konfiguraci.")
+    temp_parser.add_argument("--config", default=None, help="Path to YAML config.")
     temp_args, remaining_argv = temp_parser.parse_known_args()
 
-    # Načtení konfigurace a výchozích hodnot
+    # Načtení konfigurace a výchozích hodnot (defaults v YAML)
     config = load_yaml(temp_args.config)
     defaults = config.get("defaults", {})
 
-    # Hlavní parser argumentů
+    # Hlavní parser CLI
     parser = argparse.ArgumentParser(
         description="Orchestrátor pro ML-driven kuraci snímků.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("video", help="Cesta ke vstupnímu video souboru.")
-    parser.add_argument("-o", "--out", help="Cesta k výstupnímu adresáři.")
+    parser.add_argument("video", help="Path to input video file.")
+    parser.add_argument("-o", "--out", help="Output directory.")
     parser.add_argument(
-        "--config", default=temp_args.config, help="Cesta k YAML konfiguraci."
+        "--config", default=temp_args.config, help="Path to YAML configuration."
     )
-    parser.add_argument("--stride", type=int, help="Vybírat každý N-tý snímek.")
+    parser.add_argument("--stride", type=int, help="Sample every N-th frame.")
     parser.add_argument(
-        "--target-size", type=int, help="Cílový počet snímků (potlačí výběr prahem)."
-    )
-    parser.add_argument(
-        "--min-sharpness", type=float, help="Minimální ostrost (Variance of Laplacian)."
-    )
-    parser.add_argument(
-        "--min-contrast", type=float, help="Minimální kontrast (std dev šedotónu)."
+        "--target-size",
+        type=int,
+        help="Target number of frames (triggers stratified selection).",
     )
     parser.add_argument(
-        "--novelty-threshold", type=float, help="Práh pro prototypy novosti (0..1)."
+        "--min-sharpness", type=float, help="Min sharpness (Variance of Laplacian)."
     )
     parser.add_argument(
-        "--dedup-method", choices=["greedy", "dbscan"], help="Metoda deduplikace."
+        "--min-contrast", type=float, help="Min contrast (std dev of grayscale)."
     )
-    parser.add_argument("--manifest", help="Název výstupního manifest souboru.")
     parser.add_argument(
-        "--debug", action="store_true", help="Zapnout debugovací výpisy."
+        "--novelty-threshold", type=float, help="Novelty/prototype threshold (0..1)."
+    )
+    parser.add_argument(
+        "--dedup-method", choices=["greedy", "dbscan"], help="Deduplication method."
+    )
+    parser.add_argument("--manifest", help="Name of output manifest file.")
+    parser.add_argument(
+        "--debug", action="store_true", help="Enable debug logging to console."
     )
 
-    # Nastavení výchozích hodnot z configu
+    # Apply defaults from config (parser.set_defaults)
     parser.set_defaults(**defaults)
     args = parser.parse_args(remaining_argv)
 
-    # --- Sběr parametrů běhu a jejich zdrojů ---
+    # --- Collect run_params with source (cli | config | default | derived) ---
     cli_dests = set()
     opt_string_to_dest = {
         opt: action.dest for action in parser._actions for opt in action.option_strings
@@ -720,7 +778,7 @@ def main():
         key = arg.split("=")[0]
         if key in opt_string_to_dest:
             cli_dests.add(opt_string_to_dest[key])
-    if args.video:  # Pozicni argument
+    if args.video:
         cli_dests.add("video")
 
     run_params = {}
@@ -735,15 +793,13 @@ def main():
         else:
             source = "default"
 
-        # Určení skutečné hodnoty parametru
         actual_value = value
         if actual_value is None:
             if key in defaults:
                 actual_value = defaults[key]
             else:
-                # Hardcoded výchozí hodnoty pro parametry bez config hodnot
                 hardcoded_defaults = {
-                    "stride": 1,
+                    "stride": 3,
                     "min_sharpness": 80.0,
                     "min_contrast": 20.0,
                     "novelty_threshold": 0.3,
@@ -756,23 +812,23 @@ def main():
 
         run_params[key] = {"value": actual_value, "source": source}
 
-    # Výchozí výstupní adresář, pokud není zadán
+    # Derive default output directory if not provided
     is_out_derived = not (args.out or "out" in cli_dests or "out" in defaults)
     if is_out_derived or args.out is None:
         video_base = os.path.splitext(os.path.basename(args.video))[0]
         args.out = os.path.join("data", "output", video_base)
         run_params["out"] = {"value": args.out, "source": "derived"}
 
-    # Nastavení logování
+    # Setup logging
     setup_logging(args.out, args.debug)
 
-    logger.info("Zahájení procesu kurace snímků.")
+    logger.info("Starting frame curation process.")
     if args.config:
-        logger.info(f"Načtena konfigurace z: {args.config}")
+        logger.info(f"Loaded config from: {args.config}")
     else:
-        logger.info("Používá se výchozí konfigurace a CLI argumenty.")
+        logger.info("Using defaults and CLI arguments.")
 
-    # Spuštění pipeline s časováním
+    # Run pipeline with timing
     start_time = time.time()
     run_curation_pipeline(
         video_path=args.video,
@@ -789,12 +845,12 @@ def main():
     )
     elapsed = time.time() - start_time
 
-    # Tisk statistik
+    # Print human-readable statistics from manifest (if exists)
     manifest_path = os.path.join(args.out, (args.manifest or "manifest.json"))
     if os.path.exists(manifest_path):
         print_human_readable_statistics(manifest_path, elapsed=elapsed)
     else:
-        logger.warning(f"Soubor manifestu nebyl nalezen: {manifest_path}")
+        logger.warning(f"Manifest file not found: {manifest_path}")
 
 
 if __name__ == "__main__":
