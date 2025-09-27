@@ -870,14 +870,43 @@ def print_human_readable_statistics(
     # Overall satisfaction summary
     print(f"Overall targets: {'✅ Satisfied' if all_satisfied else '❌ NOT satisfied'}")
 
-    # Show recommendations if targets not satisfied
-    if not all_satisfied:
+    # --- Check if target-size was reached ---
+    target_size_info = run_params.get("target_size", {})
+    target_size = target_size_info.get("value")
+    target_size_reached = True
+    if target_size is not None:
+        selected_count = task_summary.get("selected_count", 0)
+        if selected_count < target_size:
+            target_size_reached = False
+            print(
+                f"\n⚠️ WARNING: Target size not reached ({selected_count}/{target_size} frames)."
+            )
+
+    # Show recommendations if targets not satisfied or target size not reached
+    if not all_satisfied or not target_size_reached:
         print("\n💡 RECOMMENDATIONS:")
-        print("   - Increase --target-size to collect more frames")
-        print("   - Reduce --min-sharpness / --min-contrast to allow more candidates")
-        print("   - Reduce --stride to sample more frames")
-        print("   - Relax deduplication strictness (lower cosine_threshold)")
-        print("   - Lower --novelty-threshold to accept more frames")
+        if not all_satisfied:
+            print(
+                "   - Stratification targets were not met. The pool of candidates might be too small or skewed."
+            )
+        if not target_size_reached:
+            print(
+                f"   - The final number of frames ({total_selected}) is less than the requested --target-size ({target_size})."
+            )
+
+        print("\n   To improve results, consider the following adjustments:")
+        print(
+            "   - Loosen pre-filtering: reduce --min-sharpness or --min-contrast to get more candidates."
+        )
+        print(
+            "   - Sample more densely: reduce --stride to process more frames from the video."
+        )
+        print(
+            "   - Adjust novelty scoring: lower --novelty-threshold to be less strict about what is a 'new' frame."
+        )
+        print(
+            "   - Relax deduplication: lower the 'cosine_threshold' in your config to keep more unique frames."
+        )
 
     if elapsed is not None:
         mins, secs = divmod(int(elapsed), 60)
