@@ -414,17 +414,13 @@ def save_results(
             ),
         },
         "axes_summary": axes_summary,
+        "strata_distribution": strata_distribution,
     }
 
+    # Manifest structure (level-0): input_video, run_params, task_summary, frames
     manifest = {
-        "video": os.path.abspath(video_path),
+        "input_video": os.path.abspath(video_path),
         "run_params": run_params or {},
-        "count_candidates": num_candidates,
-        "count_selected": len(frames),
-        "out_dir": os.path.abspath(out_dir),
-        "axes": ["altitude", "view", "cover", "lighting"],
-        "strata_distribution": strata_distribution,
-        "axes_summary": axes_summary,
         "task_summary": task_summary,
         "frames": [
             {
