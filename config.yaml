@@ -62,12 +62,21 @@ stratification:
     cover_ratio: 0.5 # práh pro rozdělení sparse/dense
     lighting_mean: 115 # práh pro rozdělení dark/bright
 
-  # Cílové podíly (součet -> 1.0). '*' se rozdělí rovnoměrně mezi nezmíněné kombinace.
-  targets:
-    "altitude:low|view:nadir|cover:dense|lighting:bright": 0.25
-
-    # ostatní kombinace dostanou rovnoměrně zbylých 0.75
-    "*": 0.75
+  # Per-axis target shares (breaking change).
+  # Provide desired relative weights per axis value. Missing axis or values default to uniform.
+  targets_axes:
+    altitude:
+      low: 0.6
+      high: 0.4
+    view:
+      nadir: 0.5
+      oblique: 0.5
+    cover:
+      sparse: 0.3
+      dense: 0.7
+    lighting:
+      dark: 0.4
+      bright: 0.6
 
   # Limity / ochrany proti dominanci špatně užitečných strat
   limits:

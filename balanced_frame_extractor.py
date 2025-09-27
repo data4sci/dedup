@@ -528,93 +528,89 @@ def evaluate_targets_from_config(
     config: Optional[Dict] = None,
 ) -> Dict:
     """
-    Given the strata_distribution (combo_key -> count) and the project config,
-    compute expected counts from `config['stratification']['targets']`, compare with actual,
-    and return an evaluation dict containing expected_counts, actual_counts, shortfalls, totals and success flag.
+    Compute expected counts from per-axis `targets_axes`.
+    Only per-axis schema is supported.
 
-    Rules:
-      - expected = round(ratio * selected_count)
-      - If '*' key exists in targets, distribute its ratio evenly among unspecified combos.
-      - If targets sum < 1.0 and '*' missing, only explicit ratios are used (remaining unallocated).
+    Behavior:
+      - Use per-axis weights (missing values -> uniform).
+      - Combine per-axis weights by product to get combo ratios, then allocate
+        expected counts using largest-remainder to ensure sum(expected)=selected_count.
     """
     if not config:
         return {"success": True, "reason": "no_config"}
 
     strat_cfg = (config or {}).get("stratification", {})
-    targets_cfg = strat_cfg.get("targets", {})
     axes_cfg = strat_cfg.get("axes", {})
+    targets_axes_cfg = strat_cfg.get("targets_axes", {})
 
-    if not targets_cfg or not axes_cfg:
-        return {"success": True, "reason": "no_targets_or_axes_defined"}
+    if not axes_cfg:
+        return {"success": True, "reason": "no_axes_defined"}
 
     # Build all possible combos in the same key format
     all_combos = _cartesian_strata_combinations(axes_cfg)
 
-    # Parse explicit targets
-    explicit = {}
-    wildcard_ratio = None
-    total_explicit_ratio = 0.0
-    for k, v in targets_cfg.items():
-        if k == "*":
-            try:
-                wildcard_ratio = float(v)
-            except Exception:
-                wildcard_ratio = None
+    # Helper: normalize axis dict
+    def _normalize(d: Dict[str, float], axis_vals: List[str]) -> Dict[str, float]:
+        for v in axis_vals:
+            d.setdefault(v, 1.0)
+        s = sum(float(x) for x in d.values()) + 1e-12
+        if s == 0:
+            n = len(axis_vals) or 1
+            return {v: 1.0 / n for v in axis_vals}
+        return {v: float(d.get(v, 0.0)) / s for v in axis_vals}
+
+    # 1) Derive per-axis normalized weights
+    per_axis_weights: Dict[str, Dict[str, float]] = {}
+    for axis, vals in axes_cfg.items():
+        requested = targets_axes_cfg.get(axis, {})
+        per_axis_weights[axis] = _normalize(
+            {k: float(v) for k, v in requested.items()}, vals
+        )
+
+    # ensure all axes present and normalized
+    for axis, vals in axes_cfg.items():
+        if axis not in per_axis_weights:
+            per_axis_weights[axis] = {v: 1.0 / max(1, len(vals)) for v in vals}
         else:
-            try:
-                explicit[k] = float(v)
-                total_explicit_ratio += float(v)
-            except Exception:
-                continue
+            per_axis_weights[axis] = _normalize(per_axis_weights[axis], vals)
 
-    # Remaining ratio to distribute
-    remaining_ratio = max(0.0, 1.0 - total_explicit_ratio)
-    unspecified_combos = [c for c in all_combos if c not in explicit]
-
-    computed_ratios = {}
-    # Assign explicit
-    for c, r in explicit.items():
-        computed_ratios[c] = r
-
-    # Assign wildcard if present
-    if wildcard_ratio is not None:
-        # wildcard_ratio represents the total share to be split among unspecified combos
-        if unspecified_combos:
-            per_combo = float(wildcard_ratio) / float(len(unspecified_combos))
-            for c in unspecified_combos:
-                computed_ratios[c] = per_combo
-        else:
-            # nothing to assign
-            pass
+    # 2) compute combo ratios by product of per-axis weights
+    combo_ratios: Dict[str, float] = {}
+    for combo in all_combos:
+        prod = 1.0
+        for part in combo.split("|"):
+            k, v = part.split(":", 1)
+            prod *= per_axis_weights.get(k, {}).get(v, 0.0)
+        combo_ratios[combo] = prod
+    # normalize
+    total = sum(combo_ratios.values()) + 1e-12
+    if total == 0:
+        n = len(combo_ratios) or 1
+        combo_ratios = {c: 1.0 / n for c in combo_ratios}
     else:
-        # If no wildcard, but remaining_ratio > 0, distribute remaining evenly among unspecified combos
-        if unspecified_combos and remaining_ratio > 0:
-            per_combo = float(remaining_ratio) / float(len(unspecified_combos))
-            for c in unspecified_combos:
-                computed_ratios[c] = per_combo
-        else:
-            # leave unspecified combos without expectations
-            for c in unspecified_combos:
-                computed_ratios.setdefault(c, 0.0)
+        combo_ratios = {c: float(r) / total for c, r in combo_ratios.items()}
 
-    # Normalize small floating rounding issues so total ratio <=1
-    # (not strictly necessary for expected counts)
-    # Compute expected counts and compare to actual
-    expected_counts = {}
-    actual_counts = {}
-    shortfalls = {}
-    total_expected = 0
-    total_actual = 0
-    for combo, ratio in computed_ratios.items():
-        expected = int(round(ratio * selected_count))
-        actual = int(strata_distribution.get(combo, 0))
-        expected_counts[combo] = expected
-        actual_counts[combo] = actual
-        if actual < expected:
-            shortfalls[combo] = expected - actual
-        total_expected += expected
-        total_actual += actual
+    # 3) allocate expected counts using Largest Remainder method to match selected_count
+    raw_expected = {c: combo_ratios[c] * selected_count for c in combo_ratios}
+    floored = {c: int(float(raw_expected[c])) for c in raw_expected}
+    remainders = {c: raw_expected[c] - floored[c] for c in raw_expected}
+    allocated = sum(floored.values())
+    to_allocate = max(0, selected_count - allocated)
+    for c, _ in sorted(remainders.items(), key=lambda x: x[1], reverse=True)[
+        :to_allocate
+    ]:
+        floored[c] += 1
 
+    expected_counts = {c: int(floored[c]) for c in floored}
+    actual_counts = {c: int(strata_distribution.get(c, 0)) for c in all_combos}
+    shortfalls = {
+        c: expected_counts[c] - actual_counts[c]
+        for c in all_combos
+        if expected_counts[c] > actual_counts[c]
+    }
+
+    total_expected = sum(expected_counts.values())
+    total_actual = sum(actual_counts.values())
     total_shortfall = sum(shortfalls.values())
     success = total_shortfall == 0
 
@@ -622,6 +618,8 @@ def evaluate_targets_from_config(
         "success": success,
         "selected_count": selected_count,
         "candidates_count": candidates_count,
+        "per_axis_weights": per_axis_weights,
+        "combo_ratios": combo_ratios,
         "expected_counts": expected_counts,
         "actual_counts": actual_counts,
         "shortfalls": shortfalls,

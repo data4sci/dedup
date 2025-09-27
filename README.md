@@ -107,7 +107,33 @@ curl -X POST "http://localhost:8000/curate" \
 
 ---
 
-## Struktura a klíče v YAML konfiguraci (používané ve skriptu)
+## Stratifikace (per-axis targets)
+
+Konfigurace cílů stratifikace nyní podporuje pouze zadávání podílů pro jednotlivé osy pomocí `targets_axes`.
+
+Příklad:
+
+```yaml
+stratification:
+  axes:
+    altitude: [low, high]
+    view: [nadir, oblique]
+    cover: [sparse, dense]
+    lighting: [dark, bright]
+  targets_axes:
+    altitude:
+      low: 0.6
+      high: 0.4
+    view:
+      nadir: 0.5
+      oblique: 0.5
+    cover:
+      sparse: 0.3
+      dense: 0.7
+    lighting:
+      dark: 0.4
+      bright: 0.6
+```
 
 Skript čte `config.yaml` a očekává, že v něm může být např. tato struktura (použité klíče):
 

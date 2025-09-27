@@ -1,19 +1,29 @@
 """
 stratification.py
 =================
-Tento modul obsahuje funkce pro stratifikaci snímků na základě agro proxy metrik a cílových limitů.
+Modul pro stratifikaci snímků na základě agro-proxy metrik a cílových limitů.
 
+Breaking change: explicitní `targets` (kombinované klíče) byly odstraněny.
+Konfigurace nyní musí používat `targets_axes` (per-axis targets).
 """
 
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from collections import defaultdict
 from itertools import product
 from bfe.frame_info import FrameInfo
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class AgroStratifier:
     """
     Převádí kontinuální proxy -> binned straty a udržuje výběr podle YAML targetů.
+
+    Chování:
+      - Očekává `stratification.targets_axes` jako mapu axis -> {value: weight}.
+      - Pokud `targets_axes` chybí, použije se uniformní rozdělení po osách.
+      - Vytvoří interní `self.targets` mapu (combo_key -> normalized ratio, suma==1.0).
     """
 
     def __init__(self, config: Dict):
@@ -27,17 +37,24 @@ class AgroStratifier:
                 "lighting": ["dark", "bright"],
             },
         )
-        self.targets_raw: Dict[str, float] = sconf.get("targets", {"*": 1.0})
+
+        # Per-axis targets (breaking change)
+        self.targets_axes_raw: Dict[str, Dict[str, float]] = sconf.get(
+            "targets_axes", {}
+        )
+
+        # Limits / protections (unchanged)
         self.limits = sconf.get(
             "limits", {"windy_max_ratio": 0.15, "sparse_max_ratio": 0.30}
         )
+
         self.counts: Dict[str, int] = defaultdict(int)
         self.total_selected: int = 0
 
-        # Expand '*' later proportionally over missing combinations
+        # All possible combo keys (cartesian product)
         self.combinations = self._all_combinations()
 
-        # Compile explicit targets and distribute wildcard
+        # Compile per-combination normalized targets (sums to 1.0)
         self.targets = self._compile_targets()
 
     def _all_combinations(self) -> List[str]:
@@ -52,38 +69,66 @@ class AgroStratifier:
             combos.append("|".join(parts))
         return combos
 
+    def _normalize_axis_weights(
+        self, axis_weights: Dict[str, float]
+    ) -> Dict[str, float]:
+        s = sum(axis_weights.values()) + 1e-12
+        if s == 0:
+            n = len(axis_weights) or 1
+            return {k: 1.0 / n for k in axis_weights}
+        return {k: float(v) / s for k, v in axis_weights.items()}
+
     def _compile_targets(self) -> Dict[str, float]:
         """
-        Kompiluje explicitní cíle a distribuuje wildcard hodnoty.
+        Sestaví `self.targets` — map combo_key -> normalized ratio (suma == 1.0).
+
+        Postup:
+          1) Použije `targets_axes` pokud je zadané (částečné hodnoty doplní uniformně).
+          2) Pokud není, použije uniformní rozdělení po osách.
+          3) Vypočítá produktní skóre pro každou kombinaci a normalizuje.
         """
-        explicit_total = sum(v for k, v in self.targets_raw.items() if k != "*")
-        wildcard = self.targets_raw.get("*", 0.0)
-        remaining = max(0.0, 1.0 - explicit_total)
-        if wildcard > 0:
-            wildcard_share = remaining
+        axis_weights_raw: Dict[str, Dict[str, float]] = {}
+
+        if self.targets_axes_raw:
+            for axis, vals in self.axes.items():
+                requested = self.targets_axes_raw.get(axis, {})
+                weights = {v: float(requested.get(v, 1.0)) for v in vals}
+                axis_weights_raw[axis] = self._normalize_axis_weights(weights)
         else:
-            wildcard_share = 0.0
+            for axis, vals in self.axes.items():
+                axis_weights_raw[axis] = {v: 1.0 / max(1, len(vals)) for v in vals}
 
-        explicit_keys = {k for k in self.targets_raw.keys() if k != "*"}
-        missing = [c for c in self.combinations if c not in explicit_keys]
-        per = (wildcard_share / len(missing)) if missing and wildcard_share > 0 else 0.0
-
-        targets = {}
-        for c in self.combinations:
-            if c in self.targets_raw and c != "*":
-                targets[c] = float(self.targets_raw[c])
+        # ensure coverage & normalize
+        for axis, vals in self.axes.items():
+            if axis not in axis_weights_raw:
+                axis_weights_raw[axis] = {v: 1.0 / max(1, len(vals)) for v in vals}
             else:
-                targets[c] = float(per)
-        s = sum(targets.values()) + 1e-9
-        for k in list(targets.keys()):
-            targets[k] = targets[k] / s
+                for v in vals:
+                    axis_weights_raw[axis].setdefault(v, 1.0)
+                axis_weights_raw[axis] = self._normalize_axis_weights(
+                    axis_weights_raw[axis]
+                )
+
+        # compute product for each combo
+        combo_scores: Dict[str, float] = {}
+        for combo in self.combinations:
+            parts = combo.split("|")
+            prod = 1.0
+            for part in parts:
+                k, v = part.split(":", 1)
+                prod *= axis_weights_raw.get(k, {}).get(v, 0.0)
+            combo_scores[combo] = prod
+
+        # normalize combo scores to sum to 1.0
+        total = sum(combo_scores.values()) + 1e-12
+        if total == 0:
+            n = len(combo_scores) or 1
+            return {c: 1.0 / n for c in combo_scores}
+        targets = {c: float(s) / total for c, s in combo_scores.items()}
         return targets
 
     @staticmethod
     def combo_key(altitude: str, view: str, cover: str, lighting: str) -> str:
-        """
-        Vytvoří klíč pro kombinaci stratifikace.
-        """
         return f"altitude:{altitude}|view:{view}|cover:{cover}|lighting:{lighting}"
 
     def select(
@@ -127,9 +172,6 @@ class AgroStratifier:
         key: Optional[str] = None,
         cover: Optional[str] = None,
     ) -> float:
-        """
-        Vypočítá aktuální poměr vybraných snímků pro daný klíč nebo pokrytí.
-        """
         if not selected:
             return 0.0
         if cover is not None:
