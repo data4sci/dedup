@@ -390,6 +390,32 @@ def save_results(
         axes_summary["cover"][c] = axes_summary["cover"].get(c, 0) + 1
         axes_summary["lighting"][l] = axes_summary["lighting"].get(l, 0) + 1
 
+    task_summary = {
+        "video": os.path.basename(video_path),
+        "output_dir": os.path.abspath(out_dir),
+        "candidates_count": num_candidates,
+        "selected_count": len(frames),
+        "selection_ratio": (
+            f"{(len(frames) / num_candidates * 100):.1f}%"
+            if num_candidates > 0
+            else "N/A"
+        ),
+        "ml_score": {
+            "average": (
+                f"{np.mean([f.ml_score for f in frames]):.3f}" if frames else "N/A"
+            ),
+            "median": (
+                f"{np.median([f.ml_score for f in frames]):.3f}" if frames else "N/A"
+            ),
+            "range": (
+                f"{min([f.ml_score for f in frames]):.3f} - {max([f.ml_score for f in frames]):.3f}"
+                if frames
+                else "N/A"
+            ),
+        },
+        "axes_summary": axes_summary,
+    }
+
     manifest = {
         "video": os.path.abspath(video_path),
         "run_params": run_params or {},
@@ -399,6 +425,7 @@ def save_results(
         "axes": ["altitude", "view", "cover", "lighting"],
         "strata_distribution": strata_distribution,
         "axes_summary": axes_summary,
+        "task_summary": task_summary,
         "frames": [
             {
                 "saved_path": os.path.abspath(p),
@@ -527,21 +554,17 @@ def print_human_readable_statistics(
     print("📊 STATISTIKY KURACE SNÍMKŮ")
     print("=" * 80)
 
-    # Základní informace
-    total_candidates = manifest.get("count_candidates", 0)
-    total_selected = manifest.get("count_selected", 0)
-    frames = manifest.get("frames", [])
-    run_params = manifest.get("run_params", {})
-
-    print(f"🎬 Video: {os.path.basename(manifest.get('video', 'Neznámé'))}")
-    print(f"📁 Výstup: {manifest.get('out_dir', 'Neznámý')}")
+    # Základní informace z task_summary
+    task_summary = manifest.get("task_summary", {})
+    print(f"🎬 Video: {task_summary.get('video', 'Neznámé')}")
+    print(f"📁 Výstup: {task_summary.get('output_dir', 'Neznámý')}")
     print(
-        f"🔢 Výběr: {total_selected:,} snímků vybráno z {total_candidates:,} kandidátů"
+        f"🔢 Výběr: {task_summary.get('selected_count', 'N/A')} snímků vybráno z {task_summary.get('candidates_count', 'N/A')} kandidátů"
     )
-    if total_candidates > 0:
-        print(f"📈 Poměr výběru: {(total_selected/total_candidates*100):.1f}%")
+    print(f"📈 Poměr výběru: {task_summary.get('selection_ratio', 'N/A')}")
 
     # Parametry běhu
+    run_params = manifest.get("run_params", {})
     if run_params:
         print("\n⚙️ POUŽITÉ PARAMETRY:")
         # Pořadí pro hezčí výpis
@@ -565,6 +588,7 @@ def print_human_readable_statistics(
                 source = param.get("source", "N/A")
                 print(f"   - {key:20}: {str(value):<25} (zdroj: {source})")
 
+    frames = manifest.get("frames", [])
     if not frames:
         print("\n⚠️ V manifestu nebyly nalezeny žádné snímky.")
         print("=" * 80)
@@ -578,23 +602,31 @@ def print_human_readable_statistics(
         print(f"   Medián: {np.median(ml_scores):.3f}")
         print(f"   Rozsah: {min(ml_scores):.3f} - {max(ml_scores):.3f}")
 
-    # Rozdělení podle strat
-    axis_counts = {
-        "altitude": defaultdict(int),
-        "view": defaultdict(int),
-        "cover": defaultdict(int),
-        "lighting": defaultdict(int),
-    }
-    for fr in frames:
-        strata = fr.get("strata", [])
-        if len(strata) == 4:
-            a, v, c, l = strata
-            axis_counts["altitude"][a] += 1
-            axis_counts["view"][v] += 1
-            axis_counts["cover"][c] += 1
-            axis_counts["lighting"][l] += 1
+    # Rozdělení podle strat — preferovat top-level agregace z manifestu pokud jsou dostupné
+    axes_summary = manifest.get("axes_summary")
+    if axes_summary:
+        # axes_summary je map: osa -> {hodnota: count}
+        axis_counts = {
+            axis: defaultdict(int, counts) for axis, counts in axes_summary.items()
+        }
+    else:
+        axis_counts = {
+            "altitude": defaultdict(int),
+            "view": defaultdict(int),
+            "cover": defaultdict(int),
+            "lighting": defaultdict(int),
+        }
+        for fr in frames:
+            strata = fr.get("strata", [])
+            if len(strata) == 4:
+                a, v, c, l = strata
+                axis_counts["altitude"][a] += 1
+                axis_counts["view"][v] += 1
+                axis_counts["cover"][c] += 1
+                axis_counts["lighting"][l] += 1
 
     print("\n🏔️ ROZDĚLENÍ PODLE OS STRATIFIKACE:")
+    total_selected = task_summary.get("selected_count", 0)
     for axis, counts in axis_counts.items():
         print(f"   --- {axis.upper()} ---")
         for label, count in sorted(counts.items()):
