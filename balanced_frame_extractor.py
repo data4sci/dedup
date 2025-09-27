@@ -481,11 +481,152 @@ def save_results(
         ],
     }
 
+    # Evaluate stratification targets (if present in config) and attach to manifest.
+    try:
+        targets_eval = evaluate_targets_from_config(
+            strata_distribution=strata_distribution,
+            selected_count=len(frames),
+            candidates_count=num_candidates,
+            config=config,
+        )
+        manifest["targets_evaluation"] = targets_eval
+    except Exception as e:
+        logger.debug(f"Targets evaluation skipped due to error: {e}")
+
     manifest_path = os.path.join(out_dir, manifest_name)
     with open(manifest_path, "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, ensure_ascii=False, indent=2)
 
     logger.info(f"Manifest saved to: {manifest_path}")
+
+
+# -----------------------------------------------------------------------------
+# Helper: targets evaluation for stratification.targets
+# -----------------------------------------------------------------------------
+def _cartesian_strata_combinations(axes: Dict[str, List[str]]) -> List[str]:
+    """
+    Build combo keys in the same format used in manifest ('altitude:low|view:nadir|cover:dense|lighting:bright').
+    The axes dict is expected to have the keys in the order: altitude, view, cover, lighting.
+    """
+    import itertools
+
+    axis_names = list(axes.keys())
+    axis_values = [axes[k] for k in axis_names]
+    combos = []
+    for vals in itertools.product(*axis_values):
+        parts = [f"{name}:{val}" for name, val in zip(axis_names, vals)]
+        combos.append("|".join(parts))
+    return combos
+
+
+def evaluate_targets_from_config(
+    strata_distribution: Dict[str, int],
+    selected_count: int,
+    candidates_count: int,
+    config: Optional[Dict] = None,
+) -> Dict:
+    """
+    Given the strata_distribution (combo_key -> count) and the project config,
+    compute expected counts from `config['stratification']['targets']`, compare with actual,
+    and return an evaluation dict containing expected_counts, actual_counts, shortfalls, totals and success flag.
+
+    Rules:
+      - expected = round(ratio * selected_count)
+      - If '*' key exists in targets, distribute its ratio evenly among unspecified combos.
+      - If targets sum < 1.0 and '*' missing, only explicit ratios are used (remaining unallocated).
+    """
+    if not config:
+        return {"success": True, "reason": "no_config"}
+
+    strat_cfg = (config or {}).get("stratification", {})
+    targets_cfg = strat_cfg.get("targets", {})
+    axes_cfg = strat_cfg.get("axes", {})
+
+    if not targets_cfg or not axes_cfg:
+        return {"success": True, "reason": "no_targets_or_axes_defined"}
+
+    # Build all possible combos in the same key format
+    all_combos = _cartesian_strata_combinations(axes_cfg)
+
+    # Parse explicit targets
+    explicit = {}
+    wildcard_ratio = None
+    total_explicit_ratio = 0.0
+    for k, v in targets_cfg.items():
+        if k == "*":
+            try:
+                wildcard_ratio = float(v)
+            except Exception:
+                wildcard_ratio = None
+        else:
+            try:
+                explicit[k] = float(v)
+                total_explicit_ratio += float(v)
+            except Exception:
+                continue
+
+    # Remaining ratio to distribute
+    remaining_ratio = max(0.0, 1.0 - total_explicit_ratio)
+    unspecified_combos = [c for c in all_combos if c not in explicit]
+
+    computed_ratios = {}
+    # Assign explicit
+    for c, r in explicit.items():
+        computed_ratios[c] = r
+
+    # Assign wildcard if present
+    if wildcard_ratio is not None:
+        # wildcard_ratio represents the total share to be split among unspecified combos
+        if unspecified_combos:
+            per_combo = float(wildcard_ratio) / float(len(unspecified_combos))
+            for c in unspecified_combos:
+                computed_ratios[c] = per_combo
+        else:
+            # nothing to assign
+            pass
+    else:
+        # If no wildcard, but remaining_ratio > 0, distribute remaining evenly among unspecified combos
+        if unspecified_combos and remaining_ratio > 0:
+            per_combo = float(remaining_ratio) / float(len(unspecified_combos))
+            for c in unspecified_combos:
+                computed_ratios[c] = per_combo
+        else:
+            # leave unspecified combos without expectations
+            for c in unspecified_combos:
+                computed_ratios.setdefault(c, 0.0)
+
+    # Normalize small floating rounding issues so total ratio <=1
+    # (not strictly necessary for expected counts)
+    # Compute expected counts and compare to actual
+    expected_counts = {}
+    actual_counts = {}
+    shortfalls = {}
+    total_expected = 0
+    total_actual = 0
+    for combo, ratio in computed_ratios.items():
+        expected = int(round(ratio * selected_count))
+        actual = int(strata_distribution.get(combo, 0))
+        expected_counts[combo] = expected
+        actual_counts[combo] = actual
+        if actual < expected:
+            shortfalls[combo] = expected - actual
+        total_expected += expected
+        total_actual += actual
+
+    total_shortfall = sum(shortfalls.values())
+    success = total_shortfall == 0
+
+    return {
+        "success": success,
+        "selected_count": selected_count,
+        "candidates_count": candidates_count,
+        "expected_counts": expected_counts,
+        "actual_counts": actual_counts,
+        "shortfalls": shortfalls,
+        "total_expected": total_expected,
+        "total_actual": total_actual,
+        "total_shortfall": total_shortfall,
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -678,6 +819,61 @@ def print_human_readable_statistics(
         for label, count in sorted(counts.items()):
             pct = (count / total_selected * 100) if total_selected > 0 else 0
             print(f"     {label:10}: {count:4} ({pct:5.1f}%)")
+
+    # Targets evaluation (if present)
+    targets_eval = (
+        manifest.get("targets_evaluation") if "manifest" in locals() else None
+    )
+    # Fallback: try to load from manifest_path file if not in local manifest variable
+    if not targets_eval:
+        # attempt to read targets_evaluation from manifest file path if exists
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as _fh:
+                _m = json.load(_fh)
+                targets_eval = _m.get("targets_evaluation")
+        except Exception:
+            targets_eval = None
+
+    if targets_eval:
+        print("\n🎯 STRATIFICATION TARGETS EVALUATION:")
+        print(
+            f"   Selected frames: {targets_eval.get('selected_count')} (candidates: {targets_eval.get('candidates_count')})"
+        )
+        success = targets_eval.get("success", False)
+        if success:
+            print("   ✅ Targets satisfied.")
+        else:
+            total_shortfall = targets_eval.get("total_shortfall", 0)
+            print("   ❌ Targets NOT satisfied.")
+            print(f"   Total shortfall (frames needed): {total_shortfall}")
+            shortfalls = targets_eval.get("shortfalls", {})
+            if shortfalls:
+                print("   Missing by combination:")
+                for combo, deficit in sorted(shortfalls.items(), key=lambda x: -x[1]):
+                    expected = targets_eval.get("expected_counts", {}).get(combo, 0)
+                    actual = targets_eval.get("actual_counts", {}).get(combo, 0)
+                    pct = (deficit / expected * 100) if expected > 0 else 0
+                    print(
+                        f"     - {combo}: expected {expected}, actual {actual}, missing {deficit} ({pct:4.1f}%)"
+                    )
+
+            # Recommendations for next run
+            print("\n   Suggested actions to improve coverage in next run:")
+            print(
+                "     - Increase --target-size by the total shortfall to attempt collecting more frames."
+            )
+            print(
+                "     - Reduce --min-sharpness / --min-contrast to allow more candidates pass prefilter."
+            )
+            print(
+                "     - Reduce --stride to sample more frames (e.g., halve the value)."
+            )
+            print(
+                "     - Relax deduplication strictness (if using greedy: lower cosine_threshold, or switch to dbscan and increase eps)."
+            )
+            print(
+                "     - Lower --novelty-threshold to accept more non-novel frames, or provide additional input videos to increase candidate pool."
+            )
 
     if elapsed is not None:
         mins, secs = divmod(int(elapsed), 60)
