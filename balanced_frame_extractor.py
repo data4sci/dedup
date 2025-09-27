@@ -528,13 +528,12 @@ def evaluate_targets_from_config(
     config: Optional[Dict] = None,
 ) -> Dict:
     """
-    Compute expected counts from per-axis `targets_axes`.
-    Only per-axis schema is supported.
+    Compute expected counts for stratification targets using per-axis `targets_axes`.
 
     Behavior:
-      - Use per-axis weights (missing values -> uniform).
-      - Combine per-axis weights by product to get combo ratios, then allocate
-        expected counts using largest-remainder to ensure sum(expected)=selected_count.
+      - Uses per-axis weights (missing values default to uniform).
+      - Combines per-axis weights by product to get combination ratios.
+      - Allocates expected counts using largest-remainder method to ensure sum(expected)=selected_count.
     """
     if not config:
         return {"success": True, "reason": "no_config"}
@@ -743,8 +742,7 @@ def print_human_readable_statistics(
         return
 
     print("\n" + "=" * 80)
-    print("📊 FRAME CURATION STATISTICS")
-    print("=" * 80)
+    print("📊 FRAME CURATION STATISTICS:")
 
     task_summary = manifest.get("task_summary", {})
     print(f"🎬 Video: {task_summary.get('video', 'Unknown')}")
@@ -812,68 +810,74 @@ def print_human_readable_statistics(
                 axis_counts["cover"][c] += 1
                 axis_counts["lighting"][l] += 1
 
-    print("\n🏔️ STRATIFICATION AXES DISTRIBUTION:")
+    # --- STRATIFICATION TABLE ---
+    print("\n🏔️ STRATIFICATION:")
     total_selected = task_summary.get("selected_count", 0)
-    for axis, counts in axis_counts.items():
-        print(f"   --- {axis.upper()} ---")
-        for label, count in sorted(counts.items()):
-            pct = (count / total_selected * 100) if total_selected > 0 else 0
-            print(f"     {label:10}: {count:4} ({pct:5.1f}%)")
-
-    # Targets evaluation (if present)
-    targets_eval = (
-        manifest.get("targets_evaluation") if "manifest" in locals() else None
-    )
-    # Fallback: try to load from manifest_path file if not in local manifest variable
-    if not targets_eval:
-        # attempt to read targets_evaluation from manifest file path if exists
+    # Prepare targets from config
+    strat_cfg = manifest.get("config", {}).get("stratification", {})
+    targets_axes = strat_cfg.get("targets_axes", {}) if strat_cfg else {}
+    # Fallback: try to get from config.yaml if not in manifest
+    if not targets_axes:
         try:
-            with open(manifest_path, "r", encoding="utf-8") as _fh:
-                _m = json.load(_fh)
-                targets_eval = _m.get("targets_evaluation")
+            with open("config.yaml", "r", encoding="utf-8") as f:
+                import yaml
+
+                cfg = yaml.safe_load(f)
+                targets_axes = cfg.get("stratification", {}).get("targets_axes", {})
         except Exception:
-            targets_eval = None
+            targets_axes = {}
 
-    if targets_eval:
-        print("\n🎯 STRATIFICATION TARGETS EVALUATION:")
-        print(
-            f"   Selected frames: {targets_eval.get('selected_count')} (candidates: {targets_eval.get('candidates_count')})"
-        )
-        success = targets_eval.get("success", False)
-        if success:
-            print("   ✅ Targets satisfied.")
-        else:
-            total_shortfall = targets_eval.get("total_shortfall", 0)
-            print("   ❌ Targets NOT satisfied.")
-            print(f"   Total shortfall (frames needed): {total_shortfall}")
-            shortfalls = targets_eval.get("shortfalls", {})
-            if shortfalls:
-                print("   Missing by combination:")
-                for combo, deficit in sorted(shortfalls.items(), key=lambda x: -x[1]):
-                    expected = targets_eval.get("expected_counts", {}).get(combo, 0)
-                    actual = targets_eval.get("actual_counts", {}).get(combo, 0)
-                    pct = (deficit / expected * 100) if expected > 0 else 0
-                    print(
-                        f"     - {combo}: expected {expected}, actual {actual}, missing {deficit} ({pct:4.1f}%)"
-                    )
+    # Prepare per-value satisfaction (strict: actual >= target with minimal rounding tolerance)
+    def satisfied(actual, target):
+        return actual >= (target - 0.001)  # 0.1% tolerance for rounding errors
 
-            # Recommendations for next run
-            print("\n   Suggested actions to improve coverage in next run:")
-            print(
-                "     - Increase --target-size by the total shortfall to attempt collecting more frames."
+    print(f"{'axis':<10} {'value':<10} {'actual':>8} {'target':>8} {'satisfied':>10}")
+    print("-" * 50)
+
+    # Get all possible axis values from config axes (to show missing values as 0.0%)
+    strat_cfg_axes = {}
+    try:
+        with open("config.yaml", "r", encoding="utf-8") as f:
+            import yaml
+
+            cfg = yaml.safe_load(f)
+            strat_cfg_axes = cfg.get("stratification", {}).get("axes", {})
+    except Exception:
+        pass
+
+    all_satisfied = True
+    for axis in ["altitude", "view", "cover", "lighting"]:
+        axis_targets = targets_axes.get(axis, {})
+        counts = axis_counts.get(axis, {})
+        all_possible_values = strat_cfg_axes.get(axis, list(counts.keys()))
+
+        for label in sorted(all_possible_values):
+            actual_count = counts.get(label, 0)
+            actual_pct = (
+                (actual_count / total_selected * 100) if total_selected > 0 else 0.0
             )
-            print(
-                "     - Reduce --min-sharpness / --min-contrast to allow more candidates pass prefilter."
+            target_pct = float(
+                axis_targets.get(label, 1.0 / max(1, len(all_possible_values))) * 100
             )
+            is_satisfied = satisfied(actual_pct / 100, target_pct / 100)
+            if not is_satisfied:
+                all_satisfied = False
             print(
-                "     - Reduce --stride to sample more frames (e.g., halve the value)."
+                f"{axis:<10} {label:<10} {actual_pct:8.1f} {target_pct:8.1f} {'✅' if is_satisfied else '❌':>10}"
             )
-            print(
-                "     - Relax deduplication strictness (if using greedy: lower cosine_threshold, or switch to dbscan and increase eps)."
-            )
-            print(
-                "     - Lower --novelty-threshold to accept more non-novel frames, or provide additional input videos to increase candidate pool."
-            )
+    print("-" * 50)
+
+    # Overall satisfaction summary
+    print(f"Overall targets: {'✅ Satisfied' if all_satisfied else '❌ NOT satisfied'}")
+
+    # Show recommendations if targets not satisfied
+    if not all_satisfied:
+        print("\n💡 RECOMMENDATIONS:")
+        print("   - Increase --target-size to collect more frames")
+        print("   - Reduce --min-sharpness / --min-contrast to allow more candidates")
+        print("   - Reduce --stride to sample more frames")
+        print("   - Relax deduplication strictness (lower cosine_threshold)")
+        print("   - Lower --novelty-threshold to accept more frames")
 
     if elapsed is not None:
         mins, secs = divmod(int(elapsed), 60)
