@@ -1,0 +1,136 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Curation Results</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📊 Frame Curation Results</h1>
+        </header>
+
+        <section class="card">
+            <h2>FRAME CURATION STATISTICS</h2>
+            <p><strong>🎬 Video:</strong> {{ task_summary.video }}</p>
+            <p><strong>📁 Output:</strong> {{ task_summary.output_dir }}</p>
+            <p><strong>🔢 Selection:</strong> {{ task_summary.selected_count }} frames selected from {{ task_summary.candidates_count }} candidates</p>
+            <p><strong>📈 Selection ratio:</strong> {{ task_summary.selection_ratio }}</p>
+        </section>
+
+        <section class="card">
+            <h2>⚙️ RUN PARAMETERS</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Parameter</th>
+                        <th>Value</th>
+                        <th>Source</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for key, value in run_params.items() %}
+                    <tr>
+                        <td>{{ key }}</td>
+                        <td>{{ value.value }}</td>
+                        <td>{{ value.source }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </section>
+
+        <section class="card">
+            <h2>🎯 ML SCORE (quality + novelty)</h2>
+            <p><strong>Avg:</strong> {{ task_summary.ml_score.average }}</p>
+            <p><strong>Median:</strong> {{ task_summary.ml_score.median }}</p>
+            <p><strong>Range:</strong> {{ task_summary.ml_score.range }}</p>
+        </section>
+
+        {% if strat_table %}
+        <section class="card">
+            <h2>🏔️ STRATIFICATION</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Axis</th>
+                        <th>Value</th>
+                        <th>Actual</th>
+                        <th>Target</th>
+                        <th>Satisfied</th>
+                        <th>Show</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in strat_table %}
+                    <tr>
+                        <td>{{ row.axis }}</td>
+                        <td>{{ row.value }}</td>
+                        <td>{{ row.actual }}%</td>
+                        <td>{{ row.target }}%</td>
+                        <td>{{ row.satisfied }}</td>
+                        <td><input type="checkbox" class="strata-filter" value="{{ row.axis }}:{{ row.value }}" checked></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            <p class="overall-status">
+                <strong>Overall targets:</strong> 
+                {% if targets_eval.success %}
+                <span class="success">✅ SATISFIED</span>
+                {% else %}
+                <span class="fail">❌ NOT satisfied</span>
+                {% endif %}
+            </p>
+        </section>
+        {% endif %}
+
+        {% if warnings %}
+        <section class="card warning">
+            <h2>⚠️ WARNINGS</h2>
+            <ul>
+                {% for warning in warnings %}
+                <li>{{ warning }}</li>
+                {% endfor %}
+            </ul>
+        </section>
+        {% endif %}
+
+        {% if recommendations %}
+        <section class="card recommendation">
+            <h2>💡 RECOMMENDATIONS</h2>
+            <ul>
+                {% for rec in recommendations %}
+                <li>{{ rec }}</li>
+                {% endfor %}
+            </ul>
+        </section>
+        {% endif %}
+
+        <section class="card">
+             <h2>⏱️ Elapsed time: {{ "%.2f"|format(elapsed_time|float) }}s</h2>
+        </section>
+
+        <section>
+            <h2>Selected Frames</h2>
+            <div id="frames-grid">
+                {% for frame in manifest.frames %}
+                <div class="frame-card" data-strata="{{ frame.strata_combined | join(',') }}">
+                    <img src="{{ frame.web_path }}" alt="Frame {{ frame.source_index }}" loading="lazy">
+                    <div class="frame-info">
+                        <p><strong>Frame:</strong> {{ frame.source_index }}</p>
+                        <p><strong>Score:</strong> {{ frame.ml_score | round(3) }}</p>
+                        <p><strong>Strata:</strong> {{ frame.strata | join(', ') }}</p>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+        </section>
+
+    </div>
+    <script src="/static/js/results.js"></script>
+</body>
+</html>

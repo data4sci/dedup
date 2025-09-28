@@ -379,6 +379,7 @@ def run_curation_pipeline(
         run_params=run_params,
         manifest_name=kwargs.get("manifest_name") or "manifest.json",
         config=config,
+        elapsed_time=kwargs.get("elapsed_time"),
     )
 
     logger.info("Frame curation pipeline completed successfully.")

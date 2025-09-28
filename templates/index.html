@@ -1,0 +1,67 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Balanced Frame Extractor</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Upload Video for Frame Curation</h1>
+        <form id="upload-form" action="/process" method="post" enctype="multipart/form-data">
+            <div class="form-group">
+                <label for="video_file">Video File</label>
+                <input type="file" id="video_file" name="video_file" accept="video/*" required>
+            </div>
+
+            <h2>Processing Parameters</h2>
+            <div class="form-group">
+                <label for="out">Output Directory Name (optional)</label>
+                <input type="text" id="out" name="out" placeholder="e.g., data/output/my_run">
+            </div>
+            <div class="form-group">
+                <label for="overwrite">
+                    <input type="checkbox" id="overwrite" name="overwrite" value="true">
+                    Overwrite output directory if it exists
+                </label>
+            </div>
+            <div class="form-group">
+                <label for="stride">Stride</label>
+                <input type="number" id="stride" name="stride" value="{{ defaults.stride }}">
+            </div>
+            <div class="form-group">
+                <label for="target_size">Target Size</label>
+                <input type="number" id="target_size" name="target_size" value="{{ defaults.target_size }}">
+            </div>
+            <div class="form-group">
+                <label for="min_sharpness">Min Sharpness</label>
+                <input type="number" step="0.1" id="min_sharpness" name="min_sharpness" value="{{ defaults.min_sharpness }}">
+            </div>
+            <div class="form-group">
+                <label for="min_contrast">Min Contrast</label>
+                <input type="number" step="0.1" id="min_contrast" name="min_contrast" value="{{ defaults.min_contrast }}">
+            </div>
+            <div class="form-group">
+                <label for="novelty_threshold">Novelty Threshold</label>
+                <input type="number" step="0.01" id="novelty_threshold" name="novelty_threshold" value="{{ defaults.novelty_threshold }}">
+            </div>
+            <div class="form-group">
+                <label for="dedup_method">Deduplication Method</label>
+                <select id="dedup_method" name="dedup_method">
+                    <option value="greedy" {% if defaults.dedup_method == 'greedy' %}selected{% endif %}>Greedy</option>
+                    <option value="dbscan" {% if defaults.dedup_method == 'dbscan' %}selected{% endif %}>DBSCAN</option>
+                </select>
+            </div>
+
+            <button type="submit">Process Video</button>
+        </form>
+        <div id="loading" style="display: none;">
+            <p>Processing video, please wait...</p>
+            <div class="spinner"></div>
+        </div>
+    </div>
+    <script src="/static/js/main.js"></script>
+</body>
+</html>

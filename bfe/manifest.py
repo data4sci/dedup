@@ -29,6 +29,7 @@ def save_manifest_and_frames(
     run_params: Dict,
     manifest_name: str = "manifest.json",
     config: Optional[Dict] = None,
+    elapsed_time: Optional[float] = None,
 ) -> None:
     """
     Uloží vybrané snímky do adresáře a vytvoří manifest (level-0).
@@ -47,6 +48,7 @@ def save_manifest_and_frames(
         run_params (Dict): Parametry běhu se zdroji (cli/config/default).
         manifest_name (str): Název souboru manifestu (výchozí "manifest.json").
         config (Optional[Dict]): Konfigurace (používají se např. jpeg_quality).
+        elapsed_time (Optional[float]): Celkový čas běhu pipeline.
     """
     if not frames:
         logger.warning("No frames to save.")
@@ -97,6 +99,7 @@ def save_manifest_and_frames(
         "output_dir": os.path.abspath(out_dir),
         "candidates_count": num_candidates,
         "selected_count": len(frames),
+        "elapsed_time_sec": elapsed_time,
         "selection_ratio": (
             f"{(len(frames) / num_candidates * 100):.1f}%"
             if num_candidates > 0
