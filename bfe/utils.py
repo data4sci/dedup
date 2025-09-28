@@ -13,6 +13,7 @@ from typing import Dict, Optional
 
 import yaml
 
+logger = logging.getLogger(__name__)
 
 def load_yaml(path: Optional[str]) -> Dict:
     """Načte YAML konfigurační soubor a vrátí dict (pokud existuje)."""
