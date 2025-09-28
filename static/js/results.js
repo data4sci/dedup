@@ -1,19 +1,54 @@
+/* JavaScript for Results Page
+   - Frame card click opens in-page modal overlay
+   - Select All (stratification) toggles all .strata-filter checkboxes
+*/
 
-document.addEventListener('DOMContentLoaded', function() {
-    const frameCards = document.querySelectorAll('.frame-card');
-    const filterCheckboxes = document.querySelectorAll('.strata-filter');
+document.addEventListener("DOMContentLoaded", () => {
+    // Modal elements (present in template)
+    const modal = document.getElementById("frame-modal");
+    const modalImage = document.getElementById("modal-image");
+    const overlay = document.getElementById("modal-overlay");
+    const closeBtn = document.getElementById("modal-close");
 
-    filterCheckboxes.forEach(checkbox => {
-        checkbox.addEventListener('change', filterFrames);
+    function openModal(src) {
+        if (!modal || !modalImage) return;
+        modalImage.src = src;
+        modal.style.display = "block";
+        document.body.style.overflow = "hidden";
+    }
+
+    function closeModal() {
+        if (!modal || !modalImage) return;
+        modal.style.display = "none";
+        modalImage.src = "";
+        document.body.style.overflow = "";
+    }
+
+    // Open modal when any frame-card is clicked
+    const frameCards = document.querySelectorAll(".frame-card");
+    frameCards.forEach((card) => {
+        card.style.cursor = "pointer";
+        card.addEventListener("click", () => {
+            const img = card.dataset.image;
+            if (img) openModal(img);
+        });
     });
 
-    function filterFrames() {
-        const activeFilters = Array.from(document.querySelectorAll('.strata-filter:checked')).map(cb => cb.value);
+    // Close handlers
+    if (overlay) overlay.addEventListener("click", closeModal);
+    if (closeBtn) closeBtn.addEventListener("click", closeModal);
+    document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") closeModal();
+    });
 
-        frameCards.forEach(card => {
-            const cardStrata = card.dataset.strata.split(',');
-            const isVisible = activeFilters.some(filter => cardStrata.includes(filter));
-            card.style.display = isVisible ? 'block' : 'none';
+    // Select All for stratification filters
+    const selectAllStrata = document.getElementById("select-all-strata");
+    if (selectAllStrata) {
+        selectAllStrata.addEventListener("change", (e) => {
+            const checked = e.target.checked;
+            document.querySelectorAll(".strata-filter").forEach((cb) => {
+                cb.checked = checked;
+            });
         });
     }
 });

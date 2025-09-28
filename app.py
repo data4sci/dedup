@@ -217,10 +217,24 @@ async def get_results(request: Request, job: str):
                 "The pool of candidates might be too small or skewed. Consider loosening pre-filtering or sampling more densely."
             )
 
+    # Compute a user-friendly display path for the output directory.
+    # Prefer a project-relative path and, if present, trim to the first 'data/output' occurrence
+    # so paths like '/home/.../data/output/data/output/futtec' render as 'data/output/futtec'.
+    output_str = str(output_dir)
+    try:
+        rel = output_dir.relative_to(PROJECT_ROOT)
+        display_output = str(rel)
+    except ValueError:
+        display_output = output_str
+    if "data/output" in display_output:
+        idx = display_output.find("data/output")
+        display_output = display_output[idx:]
+
     context = {
         "request": request,
         "manifest": manifest,
         "output_dir": str(output_dir),
+        "display_output": display_output,
         "elapsed_time": elapsed_time,
         "run_params": run_params,
         "task_summary": task_summary,
