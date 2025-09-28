@@ -61,6 +61,7 @@ stratification:
     view_entropy: 1.8 # práh pro rozdělení nadir/oblique
     cover_ratio: 0.5 # práh pro rozdělení sparse/dense
     lighting_mean: 115 # práh pro rozdělení dark/bright
+    altitude_quantile: 0.5 # kvantil pro rozdělení low/high
 
   # Provide desired relative weights per axis value. Missing axis or values default to uniform.
   targets_axes:

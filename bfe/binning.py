@@ -8,13 +8,15 @@ Tento modul obsahuje funkce pro binning (kategorizaci) spojitých hodnot proxy m
 from __future__ import annotations
 from typing import Optional
 
-def bin_altitude(hf: float, q50: float) -> str:
+
+def bin_altitude(hf: float, quantile: float) -> str:
     """
-    Kategorizuje výšku na 'low' nebo 'high' na základě mediánu HF energie.
+    Kategorizuje výšku na 'low' nebo 'high' na základě zadaného kvantilu HF energie.
     """
-    if hf >= q50:
+    if hf >= quantile:
         return "low"  # hodně detailů -> nízko
     return "high"  # málo detailů -> vysoko
+
 
 def bin_view(ent: float, t: Optional[float] = None) -> str:
     """
@@ -26,6 +28,7 @@ def bin_view(ent: float, t: Optional[float] = None) -> str:
         return "nadir"
     return "oblique"
 
+
 def bin_cover(ratio: float, threshold: float = 0.5) -> str:
     """
     Kategorizuje pokrytí na 'dense' nebo 'sparse'.
@@ -33,6 +36,7 @@ def bin_cover(ratio: float, threshold: float = 0.5) -> str:
     if ratio >= threshold:
         return "dense"
     return "sparse"
+
 
 def bin_lighting(mean_int: float, threshold: Optional[float] = None) -> str:
     """

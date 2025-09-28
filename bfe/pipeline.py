@@ -180,8 +180,13 @@ def assign_strata_to_frames(
 
     # Altitude quantile (medián default). TODO: parametrizovat kvantil v configu, pokud požadováno.
     hf_vals = np.array([f.hf_energy for f in frames], dtype=np.float32)
-    altitude_q50 = float(np.quantile(hf_vals, 0.5))
-    logger.debug(f"Altitude quantile (q50 of hf_energy): {altitude_q50:.2f}")
+    altitude_quantile = stratification_config.get("thresholds", {}).get(
+        "altitude_quantile", 0.5
+    )
+    altitude_q50 = float(np.quantile(hf_vals, altitude_quantile))
+    logger.debug(
+        f"Altitude quantile (q{altitude_quantile} of hf_energy): {altitude_q50:.2f}"
+    )
 
     strata_counts = defaultdict(int)
     for f in frames:
