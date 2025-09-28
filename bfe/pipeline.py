@@ -320,7 +320,7 @@ def select_and_deduplicate(
 
 def run_curation_pipeline(
     video_path: str,
-    out_dir: str,
+    out_dir: Path,
     config: Optional[Dict] = None,
     **kwargs,
 ) -> None:
@@ -378,7 +378,7 @@ def run_curation_pipeline(
     # --- Krok 5: Uložení výsledků a manifest ---
     save_manifest_and_frames(
         frames=final_frames,
-        out_dir=out_dir,
+        out_dir=str(out_dir),
         video_path=video_path,
         num_candidates=len(candidates),
         run_params=run_params,

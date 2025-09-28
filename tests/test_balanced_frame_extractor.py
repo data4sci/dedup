@@ -54,7 +54,7 @@ def test_main_function(
     # Mock args
     mock_parse_args.return_value = MagicMock(
         video="test.mp4",
-        out="output",
+        out=os.path.join("data", "output", "test"),
         config=None,
         stride=1,
         target_size=None,
@@ -75,6 +75,6 @@ def test_main_function(
     main()
 
     # Assertions
-    mock_exists.assert_any_call("output")
-    mock_rmtree.assert_called_with("output")
+    mock_exists.assert_any_call(os.path.join("data", "output", "test"))
+    mock_rmtree.assert_called_with(os.path.join("data", "output", "test"))
     mock_run_pipeline.assert_called_once()

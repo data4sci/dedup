@@ -56,7 +56,9 @@ async def process_video(
     novelty_threshold: float = Form(DEFAULTS.get("novelty_threshold", 0.3)),
     dedup_method: str = Form(DEFAULTS.get("dedup_method", "greedy")),
 ):
-    logger.info(f"Uploaded filename for default dir generation: '{video_file.filename}'")
+    logger.info(
+        f"Uploaded filename for default dir generation: '{video_file.filename}'"
+    )
     if out:
         output_dir = Path(out)
     else:
@@ -125,16 +127,16 @@ async def process_video(
     except ValueError:
         job_path = output_dir
 
-    return JSONResponse(
-        {"success": True, "results_path": f"/results?job={job_path}"}
-    )
+    return JSONResponse({"success": True, "results_path": f"/results?job={job_path}"})
 
 
 @app.get("/files/{file_path:path}")
 async def serve_file(file_path: str):
     requested_path = (PROJECT_ROOT / file_path).resolve()
     if not requested_path.is_relative_to(PROJECT_ROOT):
-        raise HTTPException(status_code=403, detail="File path is outside of project directory.")
+        raise HTTPException(
+            status_code=403, detail="File path is outside of project directory."
+        )
     if not requested_path.exists():
         raise HTTPException(status_code=404, detail="File not found.")
     return FileResponse(requested_path)
@@ -179,8 +181,8 @@ async def get_results(request: Request, job: str):
                     if f"{axis}:{value}" in k
                 )
                 actual_pct = (
-                    (actual_count / max(task_summary.get("selected_count", 1), 1)) * 100
-                )
+                    actual_count / max(task_summary.get("selected_count", 1), 1)
+                ) * 100
                 satisfied = actual_pct >= (target_pct * 100)
                 strat_table.append(
                     {
@@ -199,17 +201,21 @@ async def get_results(request: Request, job: str):
         warnings.append(
             f"Target size not reached ({task_summary.get('selected_count', 0)}/{target_size} frames)."
         )
-        recommendations.extend([
-            "Loosen pre-filtering: reduce --min-sharpness or --min-contrast to get more candidates.",
-            "Sample more densely: reduce --stride to process more frames from the video.",
-            "Adjust novelty scoring: lower --novelty-threshold to be less strict about what is a 'new' frame.",
-            "Relax deduplication: lower the 'cosine_threshold' in your config to keep more unique frames."
-        ])
+        recommendations.extend(
+            [
+                "Loosen pre-filtering: reduce --min-sharpness or --min-contrast to get more candidates.",
+                "Sample more densely: reduce --stride to process more frames from the video.",
+                "Adjust novelty scoring: lower --novelty-threshold to be less strict about what is a 'new' frame.",
+                "Relax deduplication: lower the 'cosine_threshold' in your config to keep more unique frames.",
+            ]
+        )
 
     if targets_eval and not targets_eval.get("success"):
         warnings.append("Stratification targets were not met.")
         if not any("Loosen pre-filtering" in r for r in recommendations):
-             recommendations.append("The pool of candidates might be too small or skewed. Consider loosening pre-filtering or sampling more densely.")
+            recommendations.append(
+                "The pool of candidates might be too small or skewed. Consider loosening pre-filtering or sampling more densely."
+            )
 
     context = {
         "request": request,

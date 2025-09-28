@@ -96,7 +96,7 @@ def save_manifest_and_frames(
     # Task summary: agregace metrik a statistiky ML skóre
     task_summary = {
         "video": os.path.basename(video_path),
-        "output_dir": os.path.abspath(out_dir),
+        "output_dir": os.path.abspath(os.path.join("data", "output", out_dir)),
         "candidates_count": num_candidates,
         "selected_count": len(frames),
         "elapsed_time_sec": elapsed_time,

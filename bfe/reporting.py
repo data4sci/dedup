@@ -43,7 +43,7 @@ def print_human_readable_statistics(
 
     task_summary = manifest.get("task_summary", {})
     print(f"🎬 Video: {task_summary.get('video', 'Unknown')}")
-    print(f"📁 Output: {task_summary.get('output_dir', 'Unknown')}")
+    print(f"📁 Output: {task_summary.get('output_dir', 'data/output/Unknown')}")
     print(
         f"🔢 Selection: {task_summary.get('selected_count', 'N/A')} frames selected from {task_summary.get('candidates_count', 'N/A')} candidates"
     )
