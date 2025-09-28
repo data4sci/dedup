@@ -183,3 +183,125 @@ class AgroStratifier:
             )
             return c / len(selected)
         return 0.0
+
+def _cartesian_strata_combinations(axes: Dict[str, List[str]]) -> List[str]:
+    """
+    Build combo keys in the same format used in manifest ('altitude:low|view:nadir|cover:dense|lighting:bright').
+    The axes dict is expected to have the keys in the order: altitude, view, cover, lighting.
+    """
+    import itertools
+
+    axis_names = list(axes.keys())
+    axis_values = [axes[k] for k in axis_names]
+    combos = []
+    for vals in itertools.product(*axis_values):
+        parts = [f"{name}:{val}" for name, val in zip(axis_names, vals)]
+        combos.append("|".join(parts))
+    return combos
+
+
+def evaluate_targets_from_config(
+    strata_distribution: Dict[str, int],
+    selected_count: int,
+    candidates_count: int,
+    config: Optional[Dict] = None,
+) -> Dict:
+    """
+    Compute expected counts for stratification targets using per-axis `targets_axes`.
+
+    Behavior:
+      - Uses per-axis weights (missing values default to uniform).
+      - Combines per-axis weights by product to get combination ratios.
+      - Allocates expected counts using largest-remainder method to ensure sum(expected)=selected_count.
+    """
+    if not config:
+        return {"success": True, "reason": "no_config"}
+
+    strat_cfg = (config or {}).get("stratification", {})
+    axes_cfg = strat_cfg.get("axes", {})
+    targets_axes_cfg = strat_cfg.get("targets_axes", {})
+
+    if not axes_cfg:
+        return {"success": True, "reason": "no_axes_defined"}
+
+    # Build all possible combos in the same key format
+    all_combos = _cartesian_strata_combinations(axes_cfg)
+
+    # Helper: normalize axis dict
+    def _normalize(d: Dict[str, float], axis_vals: List[str]) -> Dict[str, float]:
+        for v in axis_vals:
+            d.setdefault(v, 1.0)
+        s = sum(float(x) for x in d.values()) + 1e-12
+        if s == 0:
+            n = len(axis_vals) or 1
+            return {v: 1.0 / n for v in axis_vals}
+        return {v: float(d.get(v, 0.0)) / s for v in axis_vals}
+
+    # 1) Derive per-axis normalized weights
+    per_axis_weights: Dict[str, Dict[str, float]] = {}
+    for axis, vals in axes_cfg.items():
+        requested = targets_axes_cfg.get(axis, {})
+        per_axis_weights[axis] = _normalize(
+            {k: float(v) for k, v in requested.items()}, vals
+        )
+
+    # ensure all axes present and normalized
+    for axis, vals in axes_cfg.items():
+        if axis not in per_axis_weights:
+            per_axis_weights[axis] = {v: 1.0 / max(1, len(vals)) for v in vals}
+        else:
+            per_axis_weights[axis] = _normalize(per_axis_weights[axis], vals)
+
+    # 2) compute combo ratios by product of per-axis weights
+    combo_ratios: Dict[str, float] = {}
+    for combo in all_combos:
+        prod = 1.0
+        for part in combo.split("|"):
+            k, v = part.split(":", 1)
+            prod *= per_axis_weights.get(k, {}).get(v, 0.0)
+        combo_ratios[combo] = prod
+    # normalize
+    total = sum(combo_ratios.values()) + 1e-12
+    if total == 0:
+        n = len(combo_ratios) or 1
+        combo_ratios = {c: 1.0 / n for c in combo_ratios}
+    else:
+        combo_ratios = {c: float(r) / total for c, r in combo_ratios.items()}
+
+    # 3) allocate expected counts using Largest Remainder method to match selected_count
+    raw_expected = {c: combo_ratios[c] * selected_count for c in combo_ratios}
+    floored = {c: int(float(raw_expected[c])) for c in raw_expected}
+    remainders = {c: raw_expected[c] - floored[c] for c in raw_expected}
+    allocated = sum(floored.values())
+    to_allocate = max(0, selected_count - allocated)
+    for c, _ in sorted(remainders.items(), key=lambda x: x[1], reverse=True)[
+        :to_allocate
+    ]:
+        floored[c] += 1
+
+    expected_counts = {c: int(floored[c]) for c in floored}
+    actual_counts = {c: int(strata_distribution.get(c, 0)) for c in all_combos}
+    shortfalls = {
+        c: expected_counts[c] - actual_counts[c]
+        for c in all_combos
+        if expected_counts[c] > actual_counts[c]
+    }
+
+    total_expected = sum(expected_counts.values())
+    total_actual = sum(actual_counts.values())
+    total_shortfall = sum(shortfalls.values())
+    success = total_shortfall == 0
+
+    return {
+        "success": success,
+        "selected_count": selected_count,
+        "candidates_count": candidates_count,
+        "per_axis_weights": per_axis_weights,
+        "combo_ratios": combo_ratios,
+        "expected_counts": expected_counts,
+        "actual_counts": actual_counts,
+        "shortfalls": shortfalls,
+        "total_expected": total_expected,
+        "total_actual": total_actual,
+        "total_shortfall": total_shortfall,
+    }
