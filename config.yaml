@@ -7,7 +7,7 @@ defaults:
   target_size: null # Default: None = threshold-based selection (configurable % of candidates)
   min_sharpness: 80.0
   min_contrast: 20.0
-  novelty_threshold: 0.3
+  novelty_threshold: 0.6
 
 scoring:
   weights:
@@ -18,7 +18,7 @@ scoring:
     contrast: 0.30
     exposure: 0.25
     noise: 0.10
-  novelty_memory: 64
+  novelty_memory: 32
   scale_ranges:
     sharpness: [80.0, 300.0]
     contrast: [20.0, 80.0]
@@ -37,7 +37,7 @@ selection:
   threshold_selection_ratio: 0.25
 
 deduplication:
-  cosine_threshold: 0.85
+  cosine_threshold: 0.65
   method: "greedy"
   eps: null # Auto-calculated if null, used for DBSCAN method
   min_samples: 1
